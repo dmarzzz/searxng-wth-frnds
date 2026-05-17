@@ -40,7 +40,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Build + push
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           # Multi-arch: most home-LAN users are arm64 (Apple silicon)
