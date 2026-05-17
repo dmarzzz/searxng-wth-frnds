@@ -1,0 +1,46 @@
+# examples/caddy/Caddyfile — reverse-proxy swf-node behind a public TLS endpoint.
+#
+# Deployment shape:
+#   - swf-node listens on 127.0.0.1:7777 (loopback only; this Caddyfile is
+#     the only thing that should reach it from the outside)
+#   - Caddy terminates TLS for node.example.com and forwards based on path
+#   - peer-protocol routes (Ed25519-signed responses) pass through
+#   - agent routes (`/web_search`, `/fetch_url`, `/fetch_urls`,
+#     `/local_search`) require `Authorization: Bearer <SWF_AGENT_TOKEN>`
+#
+# Set SWF_AGENT_TOKEN as a Caddy env var at start time (export
+# SWF_AGENT_TOKEN=... before `caddy run`, or systemd Environment=...).
+# swf-node MUST also have the same SWF_AGENT_TOKEN set, or the agent
+# routes will accept anything (loopback-only auth bypass).
+
+node.example.com {
+    encode zstd gzip
+
+    # Peer-protocol routes — responses are Ed25519-signed and bundles
+    # are TOFU-validated by the consumer. No additional auth needed.
+    @peer path /.well-known/indrex /search /slices/* /community/* /digest/*
+    handle @peer {
+        reverse_proxy 127.0.0.1:7777
+    }
+
+    # Agent routes — require bearer.
+    @agent path /web_search /local_search /fetch_url /fetch_urls
+    @authorized header Authorization "Bearer {env.SWF_AGENT_TOKEN}"
+    handle @agent {
+        handle @authorized {
+            reverse_proxy 127.0.0.1:7777
+        }
+        respond 401
+    }
+
+    # Health probe — no auth, useful for upstream monitors.
+    handle /health {
+        reverse_proxy 127.0.0.1:7777
+    }
+
+    # Default deny: refuse everything else so /admin/* and other
+    # privileged routes never leak past the proxy.
+    handle {
+        respond 404
+    }
+}

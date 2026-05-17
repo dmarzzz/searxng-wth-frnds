@@ -1,0 +1,83 @@
+# Minimal SearXNG settings used by the CI live-fixture (TODO-14).
+#
+# The live test suite (`pytest -m searxng_live`) talks to this instance
+# at http://127.0.0.1:8888 to catch upstream JSON-shape regressions that
+# the mock-based tests can't see.
+#
+# Engine list is intentionally tiny: it must mirror
+# `swf.search.public_egress.DEFAULT_ENGINES` (duckduckgo + brave) so the
+# allowlist assertion in the live tests has something honest to check.
+# Do NOT add engines here without also updating DEFAULT_ENGINES — the
+# whole point of the fixture is to verify the production allowlist.
+
+use_default_settings: true
+
+general:
+  instance_name: "searxng-wth-frnds-test"
+  # CI runs are short-lived; no analytics, no donate page, no tips.
+  enable_metrics: false
+
+server:
+  # Test-only secret. The container is bound to 127.0.0.1 and torn down
+  # after every CI run, so this value never sees a real network.
+  secret_key: "test-only-do-not-use-in-production"
+  bind_address: "0.0.0.0"
+  port: 8888
+  limiter: false
+  image_proxy: false
+
+search:
+  safe_search: 0
+  autocomplete: ""
+  default_lang: ""
+  formats:
+    - html
+    - json
+
+ui:
+  static_use_hash: true
+
+# Only the two engines `public_egress.DEFAULT_ENGINES` ships with.
+# Everything else from the SearXNG default settings is disabled below.
+engines:
+  - name: duckduckgo
+    engine: duckduckgo
+    shortcut: ddg
+    disabled: false
+    timeout: 5.0
+
+  - name: brave
+    engine: brave
+    shortcut: br
+    disabled: false
+    timeout: 5.0
+
+  # Disable every other engine that ships with the default settings so
+  # the `engines` allowlist assertion in the live tests is meaningful.
+  # If SearXNG adds new defaults upstream, the allowlist test will catch
+  # the drift — that's the regression-detection job this fixture exists
+  # to do.
+  - name: bing
+    engine: bing
+    disabled: true
+  - name: google
+    engine: google
+    disabled: true
+  - name: wikipedia
+    engine: wikipedia
+    disabled: true
+  - name: wikidata
+    engine: wikidata
+    disabled: true
+  - name: qwant
+    engine: qwant
+    disabled: true
+  - name: startpage
+    engine: startpage
+    disabled: true
+  - name: yahoo
+    engine: yahoo
+    disabled: true
+  - name: mojeek
+    engine: mojeek
+    disabled: true

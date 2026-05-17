@@ -1,0 +1,48 @@
+# TODO-14 live SearXNG fixture for CI.
+#
+# Brings up a minimal SearXNG bound to 127.0.0.1:8888 with ONLY the
+# engines listed in `swf.search.public_egress.DEFAULT_ENGINES`
+# (duckduckgo + brave). Used by:
+#
+#   pytest -m searxng_live
+#
+# which is opt-in — the default `pytest -q` run skips the marker so
+# devs without docker keep working. Brought up in CI by
+# `.github/workflows/searxng-live.yml`.
+#
+# Intentionally separate from `docker/docker-compose.yml`, which boots
+# the production-style stack with the local_index + local_friends
+# bind-mounts. We don't want CI's regression checks polluted by either
+# of those custom engines — the fixture is for catching upstream
+# duckduckgo/brave JSON-shape drift specifically.
+
+services:
+  searxng:
+    image: searxng/searxng:latest
+    container_name: searxng-wth-frnds-test
+    # CI runs to completion and then `docker compose down`; no need to
+    # auto-restart on failure. Surface engine errors instead of hiding
+    # them behind a restart loop.
+    restart: "no"
+    ports:
+      # Bind to 127.0.0.1 explicitly so this fixture never accidentally
+      # exposes a public-facing SearXNG on a developer laptop.
+      - "127.0.0.1:8888:8888"
+    volumes:
+      - ./searxng-test/settings.yml:/etc/searxng/settings.yml:ro
+    environment:
+      - SEARXNG_SETTINGS_PATH=/etc/searxng/settings.yml
+      - SEARXNG_PORT=8888
+      - BIND_ADDRESS=0.0.0.0:8888
+      # Keep the secret key out of CI logs by sourcing from settings.yml
+      # rather than the env (we set it inline in the test settings).
+      - INSTANCE_NAME=searxng-wth-frnds-test
+    healthcheck:
+      # /healthz returns 200 once the engines are loaded. SearXNG's
+      # default healthcheck path is fine; we just want the wait-loop
+      # in CI to be short.
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:8888/healthz"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s

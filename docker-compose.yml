@@ -1,0 +1,45 @@
+# docker-compose.yml — operator deployment for Linux hosts.
+#
+# Brings up swf-node + an optional SearXNG sidecar (gated by
+# `--profile with-searxng`). swf-node uses `network_mode: host` so
+# its mDNS broadcasts reach the LAN; this only works on Linux.
+#
+# On macOS / Windows Docker Desktop, `network_mode: host` runs inside
+# the Docker VM and does NOT expose host LAN multicast. For laptops,
+# install natively: `pipx install swf-node`.
+#
+# State is persisted via host bind-mounts to ~/.config/swf and
+# ~/world_knowledge — the same locations a native install uses.
+
+services:
+  swf-node:
+    image: ghcr.io/dmarzzz/swf-node:latest
+    # Or build locally:
+    # build: .
+    network_mode: host
+    environment:
+      SWF_BIND: 0.0.0.0
+      SWF_PORT: 7777
+      # Uncomment to point at the SearXNG sidecar below:
+      # SEARXNG_URL: http://127.0.0.1:8888
+      # Uncomment for friend-share mode (everyone is a friend):
+      # SWF_DEFAULT_SHARE_SCOPE: friends
+    volumes:
+      - ${HOME}/.config/swf:/home/swf/.config/swf
+      - ${HOME}/world_knowledge:/home/swf/world_knowledge
+      - ${HOME}/.local/share/swf:/home/swf/.local/share/swf
+    restart: unless-stopped
+
+  # SearXNG sidecar — optional. Activate with:
+  #     docker compose --profile with-searxng up
+  # Note: SearXNG itself runs in bridge mode (its own network namespace);
+  # swf-node reaches it via 127.0.0.1:8888 because swf-node is on host
+  # network mode and SearXNG publishes 8888 on the host loopback.
+  searxng:
+    image: searxng/searxng:latest
+    profiles: ["with-searxng"]
+    ports:
+      - "127.0.0.1:8888:8888"
+    volumes:
+      - ./searxng-test/settings.yml:/etc/searxng/settings.yml:ro
+    restart: unless-stopped

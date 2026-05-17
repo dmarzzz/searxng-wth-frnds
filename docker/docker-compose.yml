@@ -1,0 +1,46 @@
+# searxng-wth-frnds v0 turnkey setup.
+#
+# `docker compose up` from this directory gets you:
+#   - A searxng instance on http://localhost:8888
+#   - Our `local_index` engine bind-mounted in, so searxng queries both
+#     public engines AND your ~/world_knowledge index.
+#
+# The python side (research_agent + swf) runs on the HOST, writing to
+# ~/world_knowledge/index.db. Searxng runs in this container with the
+# host path bind-mounted read-only. WAL mode on the host writer lets
+# container readers see committed writes immediately.
+
+services:
+  searxng:
+    image: searxng/searxng:latest
+    container_name: searxng-wth-frnds
+    restart: unless-stopped
+    ports:
+      - "8888:8888"
+    volumes:
+      # Our engine files, injected directly into searxng's engines dir.
+      # (searxng hardcodes the engines directory path; there is no
+      # dotted-path plugin discovery, so bind-mount is the play.)
+      - ../src/swf/local_index.py:/usr/local/searxng/searx/engines/local_index.py:ro
+      - ../src/swf/local_friends.py:/usr/local/searxng/searx/engines/local_friends.py:ro
+
+      # Our settings.yml telling searxng about the new engines.
+      - ../searxng/settings.yml:/etc/searxng/settings.yml:ro
+
+      # Your world_knowledge archive, read-only for searxng.
+      # If you put world_knowledge elsewhere, adjust the left side.
+      - ${HOME}/world_knowledge:/world_knowledge:ro
+
+      # Peers list the local_friends engine reads. Written by `swf-peer`.
+      - ${HOME}/.config/swf/peers.yaml:/etc/swf/peers.yaml:ro
+
+    environment:
+      - SEARXNG_SETTINGS_PATH=/etc/searxng/settings.yml
+      - SEARXNG_PORT=8888
+      - BIND_ADDRESS=0.0.0.0:8888
+
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:8888/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

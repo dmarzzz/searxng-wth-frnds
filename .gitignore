@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# Environment
+.env
+.env.local
+
+# DSPy caches and compiled programs
+.dspy_cache/
+cache/
+compiled/
+*.compiled.json
+
+# fetch_url on-disk cache
+.ra_cache/
+
+# Research agent run logs (may contain sensitive queries). Kept local;
+# uncomment if you want them in git for future MIPRO compilation.
+runs/
+
+# Tool-call traces (JSONL, per-day)
+traces/
+
+# bench/search_timing.py output (regenerated on every run; not source).
+bench/timing_report.json
+
+# pytest / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Internal-only docs (debug logs, postmortems not meant for the public docs/)
+internal/
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
