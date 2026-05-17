@@ -1,0 +1,63 @@
+# Example searxng settings.yml showing how to register the local_index
+# engine from this repo. Drop this into your searxng config directory
+# (usually `/etc/searxng/settings.yml` in a Docker deployment) and
+# bind-mount `src/swf/local_index.py` into the container at
+# `/usr/local/searxng/searx/engines/local_index.py`.
+#
+# See `docker/docker-compose.yml` for a turnkey setup.
+# See `INDREX.md` section C for merger / weighting rationale.
+
+use_default_settings: true
+
+general:
+  instance_name: "searxng-wth-frnds"
+
+server:
+  # Change this before deploying beyond localhost.
+  secret_key: "change-me-to-a-random-string-before-going-anywhere-public"
+  bind_address: "0.0.0.0"
+  port: 8888
+
+search:
+  # Always sum across engines; don't weight by time.
+  safe_search: 0
+  autocomplete: ""
+  default_lang: ""
+
+engines:
+  - name: local indrex
+    engine: local_index
+    shortcut: li
+    categories: [general]
+    # Path inside the searxng container. Bind-mount ~/world_knowledge
+    # to /world_knowledge (read-only is fine for searxng's side).
+    database: /world_knowledge/index.db
+    limit: 10
+    snippet_len: 240
+    # Weight > 1 so merged URLs from local indrex + public engines
+    # float to the top. In-tree engines use 0.5–2.0; 4.0 is aggressive
+    # but in-distribution. See INDREX.md "C. SearXNG engine adapter".
+    weight: 4.0
+    disabled: false
+    timeout: 1.0
+
+  - name: local friends
+    engine: local_friends
+    shortcut: lf
+    categories: [general]
+    # Reads the same peers.yaml swf-peer writes. Bind-mount
+    # ~/.config/swf/peers.yaml to /etc/swf/peers.yaml.
+    peers_file: /etc/swf/peers.yaml
+    per_peer_timeout: 2.5
+    limit: 10
+    # Between local (4.0) and public (1.0). Friend content is trusted
+    # more than public but less than our own cache.
+    weight: 3.0
+    disabled: false
+    timeout: 4.0
+
+  # Leave the defaults enabled too — searxng merges across all of them.
+  - name: duckduckgo
+    engine: duckduckgo
+    shortcut: ddg
+    disabled: false

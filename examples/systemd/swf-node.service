@@ -1,0 +1,46 @@
+# examples/systemd/swf-node.service — user-level systemd unit for swf-node.
+#
+# Install:
+#   mkdir -p ~/.config/systemd/user
+#   cp swf-node.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now swf-node.service
+#   systemctl --user status swf-node.service
+#
+# Logs:
+#   journalctl --user -u swf-node -f
+#
+# Stop:
+#   systemctl --user stop swf-node.service
+#
+# Note: user-level systemd needs lingering enabled for the service to
+# survive logout: `loginctl enable-linger $USER`.
+
+[Unit]
+Description=swf-node — self-sovereign LAN-first peer search
+Documentation=https://github.com/dmarzzz/searxng-wth-frnds
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/swf-node
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=10
+
+# Pin a sane log level. Override per-machine by editing this unit or
+# by `systemctl --user edit swf-node.service` (drop-in override).
+Environment=SWF_LOG_LEVEL=INFO
+
+# Uncomment to bind on the LAN. Without this swf-node listens on
+# 127.0.0.1 and is invisible to peers.
+# Environment=SWF_BIND=0.0.0.0
+# Environment=SWF_PORT=7777
+
+# If you reverse-proxy this and expose agent routes (web_search etc.)
+# beyond loopback, set the bearer token both here and in the proxy.
+# Environment=SWF_AGENT_TOKEN=...
+
+[Install]
+WantedBy=default.target
