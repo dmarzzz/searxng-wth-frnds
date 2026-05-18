@@ -10,6 +10,21 @@
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
+## Downloads
+
+Every tagged release ships pre-built PyInstaller single-file binaries (no Python runtime required on the host) on the [Releases page](https://github.com/dmarzzz/searxng-wth-frnds/releases). Asset names follow a fixed pattern so embedding hosts can resolve them without parsing the release body:
+
+```
+swf-node-<version>-mac-arm64
+swf-node-<version>-mac-x64
+swf-node-<version>-linux-x64
+swf-node-<version>-linux-arm64
+```
+
+`<version>` is the git tag minus the leading `v` (e.g. tag `v0.8.0` → asset suffix `0.8.0`). Windows binaries are not produced today; it's tracked as a feature request.
+
+These binaries are intended for **embedding**: hosts like the [Shape Rotator OS](https://shaperotator.xyz) Electron app fetch the matching `(os, arch)` asset for each release and spawn it as a sidecar daemon. The binary is self-contained, runnable from an arbitrary working directory (state lives under `~/.local/share/swf/` regardless of where you start it from), and accepts the same `--bind` / `--port` flags as a pip-installed `swf-node`.
+
 swf-node is a p2p search engine that asks your friends first, forked from [searxng](https://github.com/searxng/searxng). Why ask the public internet when the friend next to you already has what you need? Right now it is a search engine for agents, dogfooded today as the backend for the [research-swarm](https://github.com/dmarzzz/research-swarm) DSPy ReAct loop. Human-facing UI work is downstream.
 
 When you ask swf-node something, it looks first at the pages already on your laptop, every page you've opened through it, full-text searchable, on disk, no network. If your machine doesn't have what you asked for, it asks your friends, a small handful of people you've added by hand, whose nodes share the LAN, whose own searching has overlapped with yours the way friends' interests tend to overlap. Only when neither layer answers does the query reach the public web, and only through the searxng layer it inherits. Searxng states plainly that its users are neither tracked nor profiled, and it can be run over Tor when that matters.
