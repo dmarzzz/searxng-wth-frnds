@@ -879,92 +879,247 @@ bundles intact). When set, the TXT record's `sync` key is omitted.
 
 ---
 
-## 9. Open questions
+## 9. Decisions (formerly "open questions")
 
-Decisions the maintainer should weigh in on before Phase 3 / hardening.
+These are the design calls that need to land before implementation
+can be unambiguous. Each was an open question in an earlier draft;
+the resolutions below are calibrated for **the 10-week, 50-person
+Shape Rotator OS cohort with a known-trust LAN model**, and assume
+ship-and-iterate beats speculative complexity. Phase 3 (post-cohort)
+can revisit anything here.
 
-### 9.1 Key rotation + cohort-key updates
+### 9.1 Key rotation — DEFER
 
-How does a member rotate their Ed25519 key without losing every record
-they've ever authored?
+Phase 2 does **not** implement a `rotation` record kind. Over 10
+weeks, key-rotation events are rare; the cost of designing for
+concurrent-rotation + lost-key + cohort-disagreement edge cases is
+too high for what's almost certainly zero real usage.
 
-Sketch: a `rotation` record kind — the old key signs an envelope
-attesting `new_pubkey = X`, the receiver updates
-`sync_record_authors[r] = X` for every `r` owned by the rotating
-member, and the `cohort-keys.json` is updated out of band to point at
-the new key. Edge cases (concurrent rotation + edit, lost old key, …)
-need a real design.
+**Phase 2 recovery procedure for a lost key** (documented, not
+automated):
 
-**Question:** is this worth shipping in Phase 3, or can we get away
-with "lost key → cohort-keys.json update + manual import of historical
-envelopes under the new author"?
+1. Member generates a new Ed25519 key locally.
+2. Member opens a PR against the cohort's `cohort-keys.json` updating
+   their entry's `pubkey` field (handle stays the same).
+3. Once merged + the Electron app re-fetches the file, the new key
+   takes over as the expected author for the member's `record_id`.
+4. Historical envelopes signed by the old key remain visible (history
+   never breaks). New writes must use the new key.
+5. Mismatch handling: incoming envelopes signed by the OLD key after
+   the rotation are accepted into history but NOT applied as latest
+   (since `record_authors[record_id]` now points at the new key, the
+   sig check fails). Practical effect: the rotated-out key can no
+   longer overwrite the member's record. That's the desired
+   behavior.
 
-### 9.2 Eviction of historical envelopes
+Phase 3 adds a proper `rotation` envelope if the cohort produces
+empirical demand.
 
-History is forever per §7.1, but on a multi-year cohort that's still
-hundreds of MB. Should there be a `prune_history(record_id, keep_last_n)`
-operation? If so, is it author-only (the author signs a tombstone
-envelope) or cohort-wide (a quorum vote)?
+### 9.2 Eviction of historical envelopes — NEVER (Phase 2 scope)
 
-**Question:** what's the right archive story? Do we ever delete?
+History is forever per §7.1. For the cohort math (50 people × ~100
+edits/member × 4 KiB/envelope) the worst case is 20 MiB total over
+the 10-week program — not a problem. Premature pruning would also
+break the "restore" affordance the user explicitly asked for, which
+is the entire reason history was specified in the first place.
 
-### 9.3 Max envelope size
+If a multi-year archive ever becomes a storage concern (multi-cohort
+swf-node, year-3 audit), a future phase can introduce author-signed
+tombstone envelopes. The protocol stays open to that — `record_type`
+already has space for new kinds. We just don't ship it now.
 
-64 KiB cap per §3.5 is generous for profile records. But cohort
-members occasionally want to include rich content (a markdown bio,
-a list of links). Do we need a higher cap (256 KiB? 1 MiB?), or
-should rich content stay out of sync entirely and live in a separate
-swf-node primitive (e.g. the existing world_knowledge markdown
-archive, referenced from a sync record by URL)?
+### 9.3 Max envelope size — keep the 64 KiB cap
 
-**Question:** what's the policy on rich content in `content`?
+Profile records' worst case (full personal-API + multi-paragraph
+bio + 6–8 links) lands well under 8 KiB. The 64 KiB ceiling is
+defensive, not a target. Rich content (long-form notes, research
+docs, presentations) should NOT travel through the sync substrate
+— it belongs in the existing `world_knowledge` markdown archive and
+referenced from a sync record via URL.
 
-### 9.4 Hybrid logical clock vs. wall-clock LWW
+Implementer guidance: reject envelopes with `len(canonical_form) >
+65536` at receive time with a 413 status. Do not negotiate higher
+caps — if a cohort member wants to share a long doc, the answer is
+"publish to world_knowledge, link from your profile."
 
-Wall-clock LWW has the known failure mode of clock skew. A 5-minute
-window (§5.4) catches the obvious cases but not subtler ones. A hybrid
-logical clock (Lamport timestamp combined with wall-clock) would be
-robust to skew but adds protocol complexity. Phase 2 ships wall-clock;
-Phase 3 hardening could revisit.
+### 9.4 Wall-clock LWW with 5-minute future window — final for Phase 2
 
-**Question:** is the 5-minute window the right value? Should we add
-HLC in Phase 3 or accept wall-clock as the final story?
+We use wall-clock `wall_ts_ms`. Envelopes with `wall_ts_ms` more
+than **5 minutes** in the future relative to the receiver's local
+clock are rejected (status 400, code `clock_too_far_ahead`). Modern
+machines on NTP have sub-second skew; 5 minutes catches both
+malicious backdating and "my battery died and the clock reset to
+2001" with margin.
 
-### 9.5 Local-write endpoint (`POST /sync/local_record`)
+HLC (Hybrid Logical Clock) is **not** added in Phase 2. We accept
+that two members editing the same minute will see LWW based on
+whichever wall clock was higher; for "edit your own profile" from
+a SINGLE device that's acceptable.
 
-§7.4 picks Option A (HTTP-driven local writes) over the file-drop
-alternative. Confirm? The route should be agent-bearer-gated like
-`/web_search` per `docs/HTTP_API.md` auth-split rules.
+The well-known failure mode of wall-clock LWW (research finding
+from `docs/PROTOCOL_RESEARCH.md` §1, citing Cassandra / DynamoDB
+operational experience) is that data can be silently discarded when
+peer clocks disagree more than the network round-trip. For our
+cohort:
+- Same-author-multi-device clock-skew loss is real but bounded by
+  the §9.9 fork policy (quarantine + log) — a near-tied edit from
+  a second device is preserved in history regardless of which one
+  "wins" current view.
+- Inter-author concurrency is rare-to-impossible because
+  single-writer-per-record means only ONE author is editing each
+  record.
 
-### 9.6 `record_id` collisions
+If post-cohort usage shows skew-driven loss, Phase 3 adds an HLC
+layer where `wall_ts_ms` becomes the high bits and a per-author
+logical counter becomes the low bits — backward-compatible because
+the existing field becomes `(hlc_high, hlc_low)` and old envelopes
+get `hlc_low = 0`.
 
-The protocol enforces single-writer-per-`record_id`, but it does NOT
-enforce that two different members can't claim the same `record_id`
-(e.g. both want `record_id="halcyon"`). Today this is prevented by
-social convention + the `cohort-keys.json` `handle` field. Should the
-protocol enforce it?
+### 9.5 Local-write endpoint — confirmed Option A (`POST /sync/local_record`)
 
-**Question:** add a `cohort-keys.json` validator that rejects duplicate
-handles? Add a server-side check on first envelope for a `record_id`
-that pins the handle to the author and refuses subsequent
-mismatched-handle envelopes?
+The Electron app pushes profile edits to swf-node via HTTP. The
+route is agent-bearer-gated (matches the `/web_search` /
+`/local_search` / `/fetch_url` auth-split rules in `docs/HTTP_API.md`).
+The file-drop alternative is rejected: it has worse error semantics,
+no way to surface "envelope rejected because signature failed," and
+no obvious atomic boundary.
 
-### 9.7 Active push (`/sync/record/<r>/announce`)
+### 9.6 record_id collisions — protocol-level enforcement (defense in depth)
 
-Phase 2.1 stub in §4.6. Worth shipping in Phase 2 itself for the
-hackerspace-edit UX (sub-second propagation instead of 30s tick), or
-defer to a follow-up?
+Two layers, both required:
 
-### 9.8 Cohort-keys file format + distribution
+1. **`cohort-keys.json` validator** rejects duplicate `handle`
+   values at parse time. Phase 2 ships this in
+   `swf.cohort_keys.load()`.
+2. **Server-side first-envelope pinning.** When swf-node receives
+   the first valid envelope for a previously-unknown `record_id`,
+   it pins `record_authors[record_id] = author_pubkey` and persists
+   it. Subsequent envelopes for the same `record_id` from a
+   DIFFERENT author are rejected with status 409 and code
+   `record_id_owned_by_other_author`.
 
-Today: hand-edited JSON file shipped with the Electron app, updated
-via PR. Phase 3+: signed-introduction web-of-trust where existing
-cohort members can vouch for new ones with a signed envelope. The
-Phase 3 design is open.
+Social convention alone is not enough — accidental collision (two
+new cohort members claiming the same handle in a 24-hour window) is
+plausible and the protocol should fail loudly, not silently let one
+overwrite the other.
 
-**Question:** what's the rollout from "JSON in repo" → "signed
-introductions"? Do we ship Phase 3 alongside swf-node v1.0 or
-sometime after?
+### 9.7 Active push (`/sync/record/<r>/announce`) — DEFER
+
+Phase 2 ships 30-second polling only. Sub-second propagation is a
+nice-to-have but not a need-to-have for "I updated my bio." Adding
+push semantics (per-record listeners, idempotency for repeated
+announces, exponential backoff on retry, dead-peer detection)
+doubles the protocol surface area for a UX gain nobody has yet
+asked for.
+
+If cohort usage shows people complaining about edit-propagation
+latency, Phase 2.1 lands the announce route. The spec leaves the
+endpoint name reserved.
+
+### 9.8 Cohort-keys distribution — JSON-in-repo for the cohort program
+
+Phase 2 ships hand-edited `cohort-keys.json` in the Electron app
+repo. New cohort member sends pubkey via Matrix → admin opens PR →
+next Electron release pulls the updated file in. Frequency: handful
+of PRs over 10 weeks.
+
+The Phase 3 design (signed introductions / web-of-trust) targets
+**after** the cohort completes the 10-week program. No commitment
+to ship inside the program; we want real usage data on how often
+new members join + how often keys rotate before designing the
+trust-graph mechanics.
+
+### 9.9 Single-writer fork policy — quarantine + log + don't replicate
+
+Research finding (`docs/PROTOCOL_RESEARCH.md` §1, footgun #2): when
+the same author publishes two divergent chains for the same
+`record_id` — typically from two devices that didn't sync first —
+every protocol in the survey (Hypercore, SSB, Matrix) handles it
+differently, and several **silently corrupt the chain**. This is
+the single most pressing finding from the research pass; the spec
+MUST state a policy before the first multi-device client lands.
+
+**Detection.** When swf-node receives a valid envelope E whose
+`author_pubkey` matches `record_authors[record_id]` AND `prev_hash`
+points at a hash that swf-node has seen, but the `wall_ts_ms` is
+LOWER than an envelope already in the chain at that depth (i.e. E
+is a competing sibling of an envelope at the same prev_hash slot),
+we have a fork.
+
+More precisely: a fork is **two envelopes E1 and E2 with the same
+`prev_hash` and the same `record_id` and the same `author_pubkey`
+but different `content_hash`**.
+
+**Phase 2 response** (modeled on SSB's forked-feed handling):
+
+1. **Persist both envelopes** in `sync_records` (history is never
+   lost — neither version is deleted).
+2. **Set a `forked: TRUE` column** on the affected `record_id` in
+   the `record_authors` table.
+3. **Stop replicating** the affected `record_id` outbound — peers
+   that don't yet know about the fork shouldn't get it from us.
+4. **Log a `RECORD_FORK_DETECTED` event** with both content_hashes,
+   the author, and the timestamps. Surface in `/health` as
+   `forked_records: [...]`.
+5. **Refuse to apply** EITHER envelope as the "latest view" for
+   that record until the author resolves it: when the author next
+   writes a new envelope (with `prev_hash` pointing at one of the
+   two forked siblings, or with a fresh `prev_hash: null` if they
+   want to reset), that NEW envelope becomes the latest and the
+   `forked: TRUE` flag clears.
+
+**UX implication** for the Electron app: when a user opens an app
+on a second device and edits their record before the second device
+has synced, the second device's edit will fork. The Electron app
+SHOULD wait for the swf-node `/sync/manifest` to settle (one sync
+cycle, ~30s on cold start) before allowing edits — and SHOULD
+warn the user if any of their records are flagged `forked: TRUE`
+in `/health`. (Phase 2 ships the protocol-level detection +
+quarantine; Electron UX warning is a follow-up.)
+
+This policy preserves the audit trail (you can always see what
+happened), avoids silent corruption, and gives the author a clean
+escape hatch (just write another envelope to resolve).
+
+### 9.10 Replay + dedup — by content_hash, NOT signature bytes
+
+Research finding (`docs/PROTOCOL_RESEARCH.md` §1, footgun #4):
+Ed25519 has a signature-malleability gotcha — non-canonical `S`
+values are accepted by some libraries (incl. older releases of
+PyNaCl / cryptography). If you dedup by `signature_bytes`, an
+attacker who replays a malleable variant of the SAME envelope will
+pass dedup AND verify — silent double-acceptance.
+
+**Phase 2 dedup rule:** the `sync_records` table has a UNIQUE
+INDEX on `(record_id, content_hash)`. Replay attempts hit the
+INSERT OR IGNORE path. This is correct regardless of signature
+canonicalization because `content_hash` covers the canonical
+serialized envelope MINUS the signature field (§3.3) — a malleable
+signature variant has the same `content_hash`, so it dedupes.
+
+(The signature is still verified before we even compute
+`content_hash`. The point is: dedup must use the content-side
+identity, not the signature-side identity.)
+
+### 9.11 Things we still don't know
+
+These genuinely remain open (no decision yet):
+
+- **Phase 3 entry criteria.** What signal triggers building active
+  push, HLC, key rotation, web-of-trust? Probably "cohort program
+  ends + we want to keep using this." Re-open before then.
+- **Multi-LAN sync.** Spec is LAN-only today. If a cohort member
+  works remotely, their swf-node doesn't see anyone else's. Bridging
+  via Matrix or a relay is plausibly Phase 4.
+- **Cross-cohort isolation.** If swf-node ever hosts records for
+  multiple cohorts on the same machine (mentor in multiple programs,
+  etc.), how do `cohort-keys.json` boundaries express that? Out of
+  scope for Phase 2; flag if it comes up.
+- **Scale-out diff algorithm.** If `record_id` count ever exceeds
+  ~10k, manifest-diff becomes wasteful and the Negentropy /
+  Willow-style range-based set reconciliation becomes the right
+  answer (`docs/PROTOCOL_RESEARCH.md` §2). Not needed for the
+  cohort scale; flag if records become document-class state.
 
 ---
 
