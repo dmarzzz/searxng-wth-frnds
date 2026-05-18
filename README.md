@@ -10,6 +10,29 @@
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
+## Downloads
+
+Every tagged release ships pre-built PyInstaller single-file binaries (no Python runtime required on the host) on the [Releases page](https://github.com/dmarzzz/searxng-wth-frnds/releases). Asset names follow a fixed pattern so embedding hosts can resolve them without parsing the release body:
+
+```
+swf-node-<version>-mac-arm64
+swf-node-<version>-mac-x64
+swf-node-<version>-linux-x64
+swf-node-<version>-linux-arm64
+```
+
+`<version>` is the git tag minus the leading `v` (e.g. tag `v0.8.0` → asset suffix `0.8.0`). Windows binaries are not produced today; it's tracked as a feature request.
+
+These binaries are intended for **embedding**: hosts like the [Shape Rotator OS](https://shaperotator.xyz) Electron app fetch the matching `(os, arch)` asset for each release and spawn it as a sidecar daemon. The binary is self-contained, runnable from an arbitrary working directory (state lives under `~/.local/share/swf/` regardless of where you start it from), and accepts the same `--bind` / `--port` / `--no-mdns` flags (and `SWF_BIND` / `SWF_PORT` / `SWF_NO_MDNS` env vars) as a pip-installed `swf-node`.
+
+There are two embedding shapes — pick the one that matches what the host app is trying to do:
+
+- **LAN-peer embedded** (the Shape Rotator OS case — what most embedders will want). The host app wants cohort peers on the same LAN to discover and gossip with this node. Spawn with `--bind 0.0.0.0` (or set `SWF_BIND=0.0.0.0`) and **leave mDNS on** (the default — don't pass `--no-mdns`, don't set `SWF_NO_MDNS=1`). swf-node auto-enables mDNS advertising whenever the bind is non-loopback, so no extra flag is needed. On macOS 15+, the host app needs `NSLocalNetworkUsageDescription` in its `Info.plist` so the OS can prompt the user for local-network access on first launch.
+
+- **Loopback-only embedded** (no LAN peers, app-internal data store). The host app wants swf-node purely as a local data plane — only the host process talks to it, no LAN neighbors involved. Spawn with `--bind 127.0.0.1 --no-mdns` (or `SWF_BIND=127.0.0.1 SWF_NO_MDNS=1`). swf-node also auto-disables mDNS on a loopback bind, so the `--no-mdns` is belt-and-suspenders — useful as an explicit signal to readers of the spawn args.
+
+If you're not sure which one you want and the host is a multi-user/multi-device product, you want the **LAN-peer** shape. That's the whole reason swf-node exists.
+
 swf-node is a p2p search engine that asks your friends first, forked from [searxng](https://github.com/searxng/searxng). Why ask the public internet when the friend next to you already has what you need? Right now it is a search engine for agents, dogfooded today as the backend for the [research-swarm](https://github.com/dmarzzz/research-swarm) DSPy ReAct loop. Human-facing UI work is downstream.
 
 When you ask swf-node something, it looks first at the pages already on your laptop, every page you've opened through it, full-text searchable, on disk, no network. If your machine doesn't have what you asked for, it asks your friends, a small handful of people you've added by hand, whose nodes share the LAN, whose own searching has overlapped with yours the way friends' interests tend to overlap. Only when neither layer answers does the query reach the public web, and only through the searxng layer it inherits. Searxng states plainly that its users are neither tracked nor profiled, and it can be run over Tor when that matters.

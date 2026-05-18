@@ -1,0 +1,226 @@
+name: release-binaries
+
+# Build PyInstaller single-file binaries for swf-node on every release tag,
+# plus on-demand via workflow_dispatch for ad-hoc test packs (no upload to
+# the release page — artifacts only). Designed so hosts that want to embed
+# the daemon (e.g. the Shape Rotator OS Electron app) can fetch a single
+# self-contained executable per (os, arch) from the GitHub release.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      pack-only:
+        description: "Build + upload as workflow artifact only (no release upload). Useful for testing the matrix without cutting a tag."
+        type: boolean
+        default: true
+
+permissions:
+  contents: write   # required for softprops/action-gh-release to attach assets
+
+concurrency:
+  group: release-binaries-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build (${{ matrix.label }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: mac-arm64
+            runner: macos-14
+            os: mac
+            arch: arm64
+          - label: mac-x64
+            runner: macos-13
+            os: mac
+            arch: x64
+          - label: linux-x64
+            runner: ubuntu-24.04
+            os: linux
+            arch: x64
+          # GitHub-hosted arm64 Linux runner. If your org doesn't have
+          # access, swap this for `ubuntu-22.04` and add a `docker run
+          # --platform linux/arm64` cross-build — see TODO in this file.
+          - label: linux-arm64
+            runner: ubuntu-24.04-arm
+            os: linux
+            arch: arm64
+    env:
+      # Force loopback so any zeroconf register attempt during a smoke
+      # spawn doesn't hang on a runner with no LAN.
+      SWF_BIND: 127.0.0.1
+      SWF_NO_MDNS: "1"
+      # Park state under the workspace so multiple matrix legs on the
+      # same runner image (none today, but cheap insurance) don't fight
+      # over ~/.local/share/swf.
+      SWF_CONFIG_DIR: ${{ github.workspace }}/.swf-smoke-config
+      SWF_STATE_DIR: ${{ github.workspace }}/.swf-smoke-state
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          # On tag pushes use the tag (minus the leading `v`). On
+          # workflow_dispatch use a dev-stamped version so artifact names
+          # are still unique and easy to grep.
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            v="${GITHUB_REF_NAME#v}"
+          else
+            v="0.0.0-dev.${GITHUB_SHA::7}"
+          fi
+          echo "version=${v}" >> "$GITHUB_OUTPUT"
+          echo "asset=swf-node-${v}-${{ matrix.label }}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          # 3.12 is the latest version pyproject.toml claims to support
+          # (requires-python = ">=3.10", classifiers up through 3.12).
+          # PyInstaller bundles the interpreter, so the runtime host
+          # doesn't need Python at all.
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install package + PyInstaller
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          # Install the project itself so `import swf` works for the
+          # entrypoint script, plus the community-full extras so the
+          # `--full` codepath is bundled. PyInstaller will only pack
+          # what's reachable from the import graph; extras keep that
+          # graph honest.
+          pip install -e '.[community-full]'
+          pip install 'pyinstaller>=6.10'
+
+      - name: Build single-file binary
+        shell: bash
+        run: |
+          # The pyproject script entrypoint is `swf.peer_server:main`.
+          # PyInstaller can't ingest the `module:func` form directly, so
+          # we generate a tiny shim that calls it. Kept inline rather
+          # than committed so it tracks the entrypoint string verbatim.
+          cat > _pyi_entrypoint.py <<'PY'
+          import sys
+          from swf.peer_server import main
+          if __name__ == "__main__":
+              sys.exit(main() or 0)
+          PY
+
+          # --collect-submodules pulls in every submodule of the named
+          # package — necessary for `swf` itself (lazy imports under
+          # community_full, bundles, hivemind, search) and for zeroconf
+          # / cryptography, both of which use dynamic imports that the
+          # static analyzer misses.
+          #
+          # `pyrage` ships abi3 wheels and imports cleanly; no hidden-
+          # import flag needed today. Re-add `--collect-all pyrage` if a
+          # future version splits into submodules.
+          pyinstaller \
+            --onefile \
+            --clean \
+            --noconfirm \
+            --name "${{ steps.ver.outputs.asset }}" \
+            --collect-submodules swf \
+            --collect-submodules zeroconf \
+            --collect-submodules cryptography \
+            --hidden-import swf.community_full \
+            --hidden-import swf.hivemind \
+            --hidden-import swf.bundles \
+            --hidden-import swf.search \
+            _pyi_entrypoint.py
+
+          ls -lh dist/
+
+      - name: Smoke test — --check
+        shell: bash
+        run: |
+          # --check is a read-only self-test (identity + DB schemas +
+          # route registry + §29.2 invariants). It exits 0 on all-pass.
+          # If PyInstaller missed a hidden import, this is where it
+          # surfaces — usually as ModuleNotFoundError before any output.
+          binary="dist/${{ steps.ver.outputs.asset }}"
+          chmod +x "$binary"
+          # Run from /tmp so we exercise the "spawned from a different
+          # cwd than the binary" path (Electron will do exactly that).
+          (cd "$(mktemp -d)" && "$GITHUB_WORKSPACE/$binary" --check)
+
+      - name: Smoke test — spawn + curl /health
+        shell: bash
+        run: |
+          binary="$GITHUB_WORKSPACE/dist/${{ steps.ver.outputs.asset }}"
+          # Use a non-default port so we don't collide with anything
+          # else on the runner, and so the test is reproducible.
+          port=17777
+          # Spawn from a scratch cwd, background it, wait for it to
+          # bind, curl /health, then SIGTERM. If the binary refuses to
+          # start (macOS "killed: 9", missing hidden-import, etc) the
+          # health check will fail fast.
+          tmpcwd="$(mktemp -d)"
+          (cd "$tmpcwd" && "$binary" --bind 127.0.0.1 --port "$port" --no-mdns) > server.log 2>&1 &
+          pid=$!
+          # Wait up to ~10s for the socket to come up.
+          for i in $(seq 1 50); do
+            if curl -fsS "http://127.0.0.1:${port}/health" >/dev/null 2>&1; then
+              break
+            fi
+            sleep 0.2
+          done
+          set +e
+          curl -fsS "http://127.0.0.1:${port}/health"
+          rc=$?
+          set -e
+          kill "$pid" 2>/dev/null || true
+          # Give it a moment to exit cleanly so we can dump its log.
+          wait "$pid" 2>/dev/null || true
+          echo "----- server.log -----"
+          cat server.log || true
+          echo "----------------------"
+          if [[ $rc -ne 0 ]]; then
+            echo "::error::/health did not respond on port ${port}"
+            exit 1
+          fi
+
+      - name: Upload workflow artifact (always)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.ver.outputs.asset }}
+          path: dist/${{ steps.ver.outputs.asset }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Attach to GitHub Release (tag pushes only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/${{ steps.ver.outputs.asset }}
+          fail_on_unmatched_files: true
+          # Don't clobber whatever the release maintainer wrote; just
+          # append assets.
+          append_body: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+# ─── runner notes ────────────────────────────────────────────────────
+# `ubuntu-24.04-arm` is GitHub's native arm64 runner image (public
+# beta as of 2024-09, generally available since 2025). If a fork
+# without arm64 runner access wants to build this matrix, the simplest
+# fallback is to swap the linux-arm64 row to:
+#
+#   - label: linux-arm64
+#     runner: ubuntu-22.04
+#     os: linux
+#     arch: arm64
+#
+# and wrap the build + smoke-test steps in `docker run --platform
+# linux/arm64 --rm -v "$PWD:/src" -w /src python:3.12-bookworm bash
+# -lc '<existing commands>'`. QEMU user-mode emulation works for
+# PyInstaller but roughly 5–10× slows the build. Keeping native for now.
