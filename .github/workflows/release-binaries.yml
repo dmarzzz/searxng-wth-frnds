@@ -211,7 +211,7 @@ jobs:
 
       - name: Attach to GitHub Release (tag pushes only)
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: dist/${{ steps.ver.outputs.asset }}
           fail_on_unmatched_files: true
