@@ -469,6 +469,8 @@ class _Handler(BaseHTTPRequestHandler):
         # themselves live below as `_do_sync_*` methods.
         if path == "/sync/manifest":
             return self._do_sync_manifest()
+        if path == "/sync/log":
+            return self._do_sync_log(parse_qs(parsed.query))
         if path.startswith("/sync/record/"):
             tail = path[len("/sync/record/"):]
             # `/sync/record/<id>` (current page) and
@@ -1456,6 +1458,11 @@ class _Handler(BaseHTTPRequestHandler):
     #: Default + max for /sync/record/<r>/history (spec §7.2).
     _SYNC_HISTORY_DEFAULT_LIMIT = 50
     _SYNC_HISTORY_MAX_LIMIT = 1000
+    #: Default + max for /sync/log (docs/SYNC.md §12). The ring
+    #: buffer holds 200 events; allowing a 500-event request gives
+    #: clients room to over-fetch without ever exceeding the ring.
+    _SYNC_LOG_DEFAULT_LIMIT = 200
+    _SYNC_LOG_MAX_LIMIT = 500
 
     def _open_sync_conn(self) -> sqlite3.Connection:
         """Open the indrex DB for sync reads / writes.
@@ -1517,6 +1524,76 @@ class _Handler(BaseHTTPRequestHandler):
             "generated_at_ms": int(_time.time() * 1000),
             "records": manifest["records"],
             "manifest_hash": manifest["manifest_hash"],
+        })
+
+    def _do_sync_log(self, qs: dict) -> None:
+        """`GET /sync/log?since_seq=<int>&since_ms=<int>&limit=<int>`.
+
+        Read-only window onto the in-process sync event ring buffer
+        (docs/SYNC.md §12). The SROS renderer polls this for a live
+        "network activity" feed + per-peer heartbeat pulses.
+
+        No auth — same posture as `/sync/manifest`. The ring is
+        per-process, restarts wipe it, so there's no durable data to
+        leak. The events themselves describe sync activity (peer
+        URLs, record_ids, content hashes) which is already inferable
+        from `/sync/manifest`.
+
+        Cursor semantics:
+          * `since_seq` is the primary cursor (monotonic, no ts
+            collisions). Pass the previous response's `tail_seq`.
+          * `since_ms` is a fallback for fresh clients without a
+            seq. Ignored if `since_seq` is set.
+          * Default limit 200 (the ring's maxlen); max 500. Higher
+            values clamp to 500.
+        """
+        from swf.identity import get_or_create_identity
+        from swf.sync.event_log import get_sync_events, tail_seq
+
+        # since_seq — optional non-negative int.
+        since_seq: int | None = None
+        if "since_seq" in qs:
+            try:
+                since_seq = int((qs.get("since_seq") or ["0"])[0])
+            except ValueError:
+                return self._respond(400, {"error": "invalid_since_seq"})
+            if since_seq < 0:
+                return self._respond(400, {"error": "invalid_since_seq"})
+
+        # since_ms — optional non-negative int.
+        since_ms: int | None = None
+        if "since_ms" in qs:
+            try:
+                since_ms = int((qs.get("since_ms") or ["0"])[0])
+            except ValueError:
+                return self._respond(400, {"error": "invalid_since_ms"})
+            if since_ms < 0:
+                return self._respond(400, {"error": "invalid_since_ms"})
+
+        # limit — default + cap.
+        limit_raw = (qs.get("limit") or [str(self._SYNC_LOG_DEFAULT_LIMIT)])[0]
+        try:
+            limit = int(limit_raw)
+        except ValueError:
+            return self._respond(400, {"error": "invalid_limit"})
+        if limit < 1:
+            return self._respond(400, {"error": "invalid_limit"})
+        if limit > self._SYNC_LOG_MAX_LIMIT:
+            limit = self._SYNC_LOG_MAX_LIMIT
+
+        events = get_sync_events(
+            since_seq=since_seq, since_ms=since_ms, limit=limit,
+        )
+        try:
+            node_pubkey_b64 = get_or_create_identity().pub_b64
+        except Exception:
+            node_pubkey_b64 = ""
+
+        return self._respond(200, {
+            "schema": "swf.sync.log.v1",
+            "node_pubkey": node_pubkey_b64,
+            "tail_seq": tail_seq(),
+            "events": events,
         })
 
     def _do_sync_record(self, record_id: str, qs: dict) -> None:
@@ -1829,6 +1906,24 @@ class _Handler(BaseHTTPRequestHandler):
             })
 
         status = 201 if result.was_new else 200
+        # Surface local writes on the sync event ring so the
+        # renderer's "network activity" feed pulses on our own
+        # edits too (docs/SYNC.md §12). Only emit on first-insert
+        # (was_new=True / 201) — replays would spam the feed.
+        if result.was_new:
+            try:
+                from swf.sync.event_log import emit_sync_event as _emit
+                _emit(
+                    "applied_local",
+                    record_id=record_id,
+                    wall_ts_ms=int(envelope["wall_ts_ms"]),
+                    content_hash=str(envelope.get("content_hash") or ""),
+                )
+            except Exception:
+                # Event emission must never break a successful
+                # write. The endpoint contract is the apply
+                # result, not the ring buffer side effect.
+                pass
         return self._respond(status, {
             "envelope": envelope,
             "was_new": result.was_new,

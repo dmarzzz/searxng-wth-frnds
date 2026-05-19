@@ -4,6 +4,28 @@ All notable changes to this project will be documented here. The
 format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.3] — 2026-05-19
+
+### Added
+- **`GET /sync/log`** endpoint (`docs/SYNC.md` §12) — read-only window
+  onto an in-process sync event ring buffer. Powers the SROS renderer's
+  live "network activity" feed + per-peer heartbeat pulses. Cursor
+  semantics: `since_seq` (primary, monotonic), `since_ms` (fallback).
+  Default limit 200, max 500. No auth — same posture as `/sync/manifest`.
+- **`swf.sync.event_log`** module: 200-event ring buffer keyed by a
+  hand-rolled monotonic `seq`. Emits `tick` (every sync iteration),
+  `manifest_fetched` / `peer_unreachable` / `peer_reachable` (per peer),
+  `pulled` (per envelope successfully applied from a remote pull), and
+  `applied_local` (per `POST /sync/local_record` 201). Ring is
+  per-process; restarts wipe it — it's a renderer-tail, not a journal.
+- **`tests/sync/test_event_log.py`** — ring wrap, cursor filtering,
+  limit caps, thread-safety smoke test, two HTTP integration tests.
+
+### Notes
+- The existing `[sync-loop] tick visited=N pulled=K applied=M` stderr
+  log line is unchanged. Both pathways are useful: stderr for ops,
+  ring for the renderer.
+
 ## [0.11.0] — 2026-05-19
 
 ### Added

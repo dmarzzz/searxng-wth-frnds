@@ -41,6 +41,12 @@ from .envelope import (
     sign_envelope,
     verify_envelope_signature,
 )
+from .event_log import (
+    emit_sync_event,
+    get_sync_events,
+    reset_event_log_for_tests,
+    tail_seq,
+)
 from .schema import ensure_schema
 from .store import (
     ApplyResult,
@@ -105,10 +111,12 @@ __all__ = [
     "build_manifest",
     "canonicalize",
     "content_hash",
+    "emit_sync_event",
     "ensure_schema",
     "envelope_hash",
     "get_record_envelopes",
     "get_record_history",
+    "get_sync_events",
     "is_lan_trust_mode",
     "is_record_forked",
     "latest_envelope",
@@ -116,6 +124,8 @@ __all__ = [
     "load_cohort_keys_cached",
     "pinned_author",
     "reset_cohort_keys_cache_for_tests",
+    "reset_event_log_for_tests",
     "sign_envelope",
+    "tail_seq",
     "verify_envelope_signature",
 ]

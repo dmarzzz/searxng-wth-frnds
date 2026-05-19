@@ -37,6 +37,7 @@ from pathlib import Path
 
 from . import is_lan_trust_mode
 from .cohort_keys import CohortKeys, load_cohort_keys_cached
+from .event_log import emit_sync_event
 from .schema import ensure_schema
 from .store import apply_envelope, build_manifest
 
@@ -107,6 +108,7 @@ def sync_with_peer(
     peer_url: str,
     cohort_keys=None,
     record_limit: int = _DEFAULT_RECORD_LIMIT,
+    peer_pubkey: str | None = None,
 ) -> tuple[int, int]:
     """Run one diff + pull pass against `peer_url`.
 
@@ -120,6 +122,11 @@ def sync_with_peer(
          envelope through `apply_envelope`.
       4. Sequential — we don't fan out parallel pulls. The puller side
          is bounded; one round-trip per record.
+
+    Side effect: emits ring-buffer events (docs/SYNC.md §12) for
+    `manifest_fetched` / `peer_unreachable` / `pulled`. `peer_pubkey`
+    is optional — used as the stable peer identifier in event
+    payloads; falls back to `peer_url` for unkeyed peers.
     """
     lan_trust = is_lan_trust_mode()
     if cohort_keys is None:
@@ -137,13 +144,52 @@ def sync_with_peer(
         cohort_keys = CohortKeys()
 
     base = peer_url.rstrip("/")
+    peer_label = peer_pubkey or ""
+    # Stable per-peer identifier for the reachability transition
+    # map. Mirrors `_tick`'s `peer_key = pubkey or url`.
+    peer_key = peer_pubkey or base
+
     remote = _http_get_json(f"{base}/sync/manifest")
     if not isinstance(remote, dict):
+        emit_sync_event(
+            "peer_unreachable",
+            peer_pubkey=peer_label,
+            peer_url=base,
+            reason="manifest_fetch_failed",
+        )
+        _record_peer_status(
+            peer_key, "unreachable",
+            peer_url=base, peer_pubkey=peer_label,
+        )
         return (0, 0)
 
     remote_records = remote.get("records")
     if not isinstance(remote_records, dict):
+        emit_sync_event(
+            "peer_unreachable",
+            peer_pubkey=peer_label,
+            peer_url=base,
+            reason="malformed_manifest",
+        )
+        _record_peer_status(
+            peer_key, "unreachable",
+            peer_url=base, peer_pubkey=peer_label,
+        )
         return (0, 0)
+
+    emit_sync_event(
+        "manifest_fetched",
+        peer_pubkey=peer_label,
+        peer_url=base,
+        record_count=len(remote_records),
+    )
+    # Successful manifest fetch → reachable. The helper emits a
+    # `peer_reachable` edge event iff the previous status was
+    # `unreachable`.
+    _record_peer_status(
+        peer_key, "reachable",
+        peer_url=base, peer_pubkey=peer_label,
+    )
 
     # Compute local manifest. Short-circuit on identical `manifest_hash`.
     try:
@@ -217,6 +263,21 @@ def sync_with_peer(
                 continue
             if result.ok and result.was_new:
                 applied += 1
+                # Per-envelope renderer signal. Skip duplicates
+                # (was_new=False) so the feed doesn't pulse on
+                # replay traffic.
+                try:
+                    wall_ts = int(env.get("wall_ts_ms") or 0)
+                except (TypeError, ValueError):
+                    wall_ts = 0
+                emit_sync_event(
+                    "pulled",
+                    peer_pubkey=peer_label,
+                    peer_url=base,
+                    record_id=record_id,
+                    wall_ts_ms=wall_ts,
+                    content_hash=str(env.get("content_hash") or ""),
+                )
 
     return (pulled, applied)
 
@@ -235,6 +296,56 @@ _last_tick_applied = 0
 # Per-peer last-attempt timestamps for the 5s rate-limit (spec §4.6).
 _peer_attempt_ts: dict[str, float] = {}
 _peer_attempt_lock = threading.Lock()
+
+# Per-peer reachability state for `peer_reachable` edge detection.
+# Values: "reachable" | "unreachable". Absent key = never contacted →
+# the first event emitted is whichever side of the boundary the next
+# fetch lands on (no event is fired for the very first contact attempt
+# beyond the natural `manifest_fetched` / `peer_unreachable`).
+_peer_status: dict[str, str] = {}
+_peer_status_lock = threading.Lock()
+
+
+def _record_peer_status(
+    peer_key: str,
+    new_status: str,
+    *,
+    peer_url: str,
+    peer_pubkey: str,
+    reason: str | None = None,
+) -> None:
+    """Update `_peer_status[peer_key]` and emit a transition event.
+
+    Only emits `peer_reachable` on `unreachable → reachable`. The
+    `peer_unreachable` event is emitted independently at the fetch
+    site (so we capture the reason there); this helper just records
+    the new status so the next reachable observation can emit the
+    edge event. We do NOT emit `peer_unreachable` here — that fires
+    in-line where the failure is observed.
+    """
+    with _peer_status_lock:
+        prev = _peer_status.get(peer_key)
+        _peer_status[peer_key] = new_status
+    if new_status == "reachable" and prev == "unreachable":
+        emit_sync_event(
+            "peer_reachable",
+            peer_pubkey=peer_pubkey,
+            peer_url=peer_url,
+        )
+    # `unreachable` after a prior `reachable`: the
+    # `peer_unreachable` event is already emitted by the fetch
+    # site; we don't double-emit here.
+    _ = reason  # reserved for future structured transition reasons
+
+
+def reset_peer_status_for_tests() -> None:
+    """Test-only: clear the per-peer reachability map.
+
+    Tests that run multiple `_tick` invocations against synthetic
+    peer lists want a clean slate between cases.
+    """
+    with _peer_status_lock:
+        _peer_status.clear()
 
 
 def loop_stats() -> tuple[int, int, int]:
@@ -348,6 +459,7 @@ def _tick(
     """One sync round: walk every discovered peer sequentially."""
     global _last_tick_visited, _last_tick_pulled, _last_tick_applied
 
+    tick_started = time.monotonic()
     visited = 0
     pulled_total = 0
     applied_total = 0
@@ -390,9 +502,24 @@ def _tick(
             try:
                 pulled, applied = sync_with_peer(
                     conn, peer_url=url, cohort_keys=cohort_keys,
+                    peer_pubkey=pubkey,
                 )
             except Exception as exc:
                 logger.error("sync_with_peer(%s) failed: %s", url, exc)
+                # Defensive: emit unreachable so the renderer's
+                # feed reflects a crashed iteration. The normal
+                # manifest-failure path emits inside
+                # `sync_with_peer` itself.
+                emit_sync_event(
+                    "peer_unreachable",
+                    peer_pubkey=pubkey or "",
+                    peer_url=url,
+                    reason="sync_with_peer_crashed",
+                )
+                _record_peer_status(
+                    peer_key, "unreachable",
+                    peer_url=url, peer_pubkey=pubkey or "",
+                )
                 continue
             pulled_total += pulled
             applied_total += applied
@@ -403,6 +530,18 @@ def _tick(
         _last_tick_visited = visited
         _last_tick_pulled = pulled_total
         _last_tick_applied = applied_total
+
+    duration_ms = int((time.monotonic() - tick_started) * 1000)
+    # Always emit a `tick` event — the renderer uses these as the
+    # heartbeat for the sync subsystem itself (a node with no peers
+    # still pulses every 30s).
+    emit_sync_event(
+        "tick",
+        visited=visited,
+        pulled=pulled_total,
+        applied=applied_total,
+        duration_ms=duration_ms,
+    )
 
     if visited or pulled_total or applied_total:
         logger.info(
@@ -487,3 +626,5 @@ def stop_sync_loop() -> None:
         t.join(timeout=2.0)
     with _peer_attempt_lock:
         _peer_attempt_ts.clear()
+    with _peer_status_lock:
+        _peer_status.clear()
