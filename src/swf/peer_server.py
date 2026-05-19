@@ -462,6 +462,23 @@ class _Handler(BaseHTTPRequestHandler):
             cid = path[len("/bundles/by_cid/"):]
             return self._do_bundles_by_cid(cid)
 
+        # ── Phase 2 sync: cohort-profile sync protocol (docs/SYNC.md) ────
+        # Three read endpoints + one write endpoint (in do_POST below).
+        # All routes load a fresh sqlite connection per request and run
+        # `swf.sync.schema.ensure_schema` defensively. The handlers
+        # themselves live below as `_do_sync_*` methods.
+        if path == "/sync/manifest":
+            return self._do_sync_manifest()
+        if path.startswith("/sync/record/"):
+            tail = path[len("/sync/record/"):]
+            # `/sync/record/<id>` (current page) and
+            # `/sync/record/<id>/history` (full append-only log) split
+            # on the suffix. Order: history match wins.
+            if tail.endswith("/history"):
+                rec = tail[: -len("/history")]
+                return self._do_sync_record_history(rec, parse_qs(parsed.query))
+            return self._do_sync_record(tail, parse_qs(parsed.query))
+
         # ── #108 ask 2: discoverable alchemist roster ────────────────────
         # `GET /alchemists` lets the alchemist Electron app + the
         # cohort viz check whether their loaded Ed25519 key is in the
@@ -1425,6 +1442,385 @@ class _Handler(BaseHTTPRequestHandler):
 
         return self._respond(201, {"cid": cid})
 
+    # ── Phase 2 sync handlers (docs/SYNC.md §4 + §7.4) ────────────────────
+    # All three GET handlers + the POST handler share a single connection
+    # pattern: open the indrex DB, `ensure_schema(conn)` from the sync
+    # substrate, do the work, close. The handlers are stateless — the
+    # peer-server thread pool gives us a fresh request per call.
+
+    #: Spec §3.5 / §9.3 — 64 KiB envelope cap.
+    _SYNC_MAX_ENVELOPE_BYTES = 64 * 1024
+    #: Default + max page size for /sync/record/ (spec §4.2).
+    _SYNC_RECORD_DEFAULT_LIMIT = 100
+    _SYNC_RECORD_MAX_LIMIT = 1000
+    #: Default + max for /sync/record/<r>/history (spec §7.2).
+    _SYNC_HISTORY_DEFAULT_LIMIT = 50
+    _SYNC_HISTORY_MAX_LIMIT = 1000
+
+    def _open_sync_conn(self) -> sqlite3.Connection:
+        """Open the indrex DB for sync reads / writes.
+
+        Same shape as `_open_bundles_conn` — a writable connection
+        because `ensure_schema` may need to CREATE TABLE on a node
+        that's never had a sync envelope written. WAL means readers
+        don't block; the sync apply path commits on its own.
+        """
+        from swf.indrex import db_path as _idx_db
+        conn = sqlite3.connect(str(_idx_db()), timeout=5.0)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _sync_record_id_valid(self, record_id: str) -> bool:
+        """`record_id` regex per spec §3.1."""
+        return bool(record_id) and bool(
+            re.match(r"^[a-z0-9._-]{1,128}$", record_id),
+        )
+
+    def _do_sync_manifest(self) -> None:
+        """`GET /sync/manifest` — return this peer's view of every record.
+
+        Spec §4.1. The response wraps `build_manifest(conn)`'s output
+        with `schema`, `node_pubkey`, and `generated_at_ms` per the
+        spec's example body. Empty `records` is a normal response —
+        a freshly-booted node has nothing to serve.
+
+        Cohort-keys not configured is NOT fatal here: the manifest
+        endpoint advertises what we have locally and is read-only. A
+        peer with no cohort serves an empty manifest. The spec's
+        "503 no_cohort_keys" applies to *incoming* sync attempts that
+        would otherwise apply envelopes (the POST path); GET is fine.
+        """
+        from swf.identity import get_or_create_identity
+        from swf.sync import build_manifest
+        from swf.sync import ensure_schema as _sync_schema
+
+        try:
+            conn = self._open_sync_conn()
+        except sqlite3.OperationalError as exc:
+            return self._respond(500, {"error": "sync_store_unavailable",
+                                       "detail": str(exc)})
+        try:
+            _sync_schema(conn)
+            manifest = build_manifest(conn)
+        finally:
+            conn.close()
+
+        try:
+            node_pubkey_b64 = get_or_create_identity().pub_b64
+        except Exception:
+            node_pubkey_b64 = ""
+
+        import time as _time
+        return self._respond(200, {
+            "schema": "swf.sync.manifest.v1",
+            "node_pubkey": node_pubkey_b64,
+            "generated_at_ms": int(_time.time() * 1000),
+            "records": manifest["records"],
+            "manifest_hash": manifest["manifest_hash"],
+        })
+
+    def _do_sync_record(self, record_id: str, qs: dict) -> None:
+        """`GET /sync/record/<record_id>?since=<ts>&limit=<n>` — spec §4.2.
+
+        Returns up to `limit` envelopes with `wall_ts_ms > since`,
+        newest-first by `(wall_ts_ms DESC, content_hash DESC)`.
+        404 when the record is unknown locally.
+        """
+        from swf.sync import (
+            ensure_schema as _sync_schema,
+        )
+        from swf.sync import (
+            get_record_envelopes,
+        )
+
+        if not self._sync_record_id_valid(record_id):
+            return self._respond(400, {"error": "invalid_record_id"})
+
+        # Parse `since` (default 0; non-negative int per spec).
+        since_raw = (qs.get("since") or ["0"])[0]
+        try:
+            since_ms = int(since_raw)
+        except ValueError:
+            return self._respond(400, {"error": "invalid_since"})
+        if since_ms < 0:
+            return self._respond(400, {"error": "invalid_since"})
+
+        # Parse `limit` (default 100, max 1000).
+        limit_raw = (qs.get("limit") or [str(self._SYNC_RECORD_DEFAULT_LIMIT)])[0]
+        try:
+            limit = int(limit_raw)
+        except ValueError:
+            return self._respond(400, {"error": "invalid_limit"})
+        if limit < 1 or limit > self._SYNC_RECORD_MAX_LIMIT:
+            return self._respond(400, {"error": "invalid_limit"})
+
+        try:
+            conn = self._open_sync_conn()
+        except sqlite3.OperationalError as exc:
+            return self._respond(500, {"error": "sync_store_unavailable",
+                                       "detail": str(exc)})
+        try:
+            _sync_schema(conn)
+            # over-fetch by 1 so we can answer `more`
+            envelopes = get_record_envelopes(
+                conn, record_id, since_ms=since_ms, limit=limit + 1,
+            )
+            row = conn.execute(
+                "SELECT COUNT(*) FROM sync_records WHERE record_id=?",
+                (record_id,),
+            ).fetchone()
+            exists = bool(row and row[0])
+        finally:
+            conn.close()
+
+        if not exists:
+            return self._respond(404, {
+                "error": "not_found", "record_id": record_id,
+            })
+
+        more = len(envelopes) > limit
+        envelopes = envelopes[:limit]
+        return self._respond(200, {
+            "schema": "swf.sync.record.v1",
+            "record_id": record_id,
+            "envelopes": envelopes,
+            "more": more,
+            "warnings": [],
+        })
+
+    def _do_sync_record_history(self, record_id: str, qs: dict) -> None:
+        """`GET /sync/record/<record_id>/history` — spec §7.2."""
+        from swf.sync import (
+            ensure_schema as _sync_schema,
+        )
+        from swf.sync import (
+            get_record_history,
+        )
+
+        if not self._sync_record_id_valid(record_id):
+            return self._respond(400, {"error": "invalid_record_id"})
+
+        limit_raw = (qs.get("limit") or [str(self._SYNC_HISTORY_DEFAULT_LIMIT)])[0]
+        try:
+            limit = int(limit_raw)
+        except ValueError:
+            return self._respond(400, {"error": "invalid_limit"})
+        if limit < 1 or limit > self._SYNC_HISTORY_MAX_LIMIT:
+            return self._respond(400, {"error": "invalid_limit"})
+
+        try:
+            conn = self._open_sync_conn()
+        except sqlite3.OperationalError as exc:
+            return self._respond(500, {"error": "sync_store_unavailable",
+                                       "detail": str(exc)})
+        try:
+            _sync_schema(conn)
+            envelopes = get_record_history(conn, record_id, limit=limit + 1)
+        finally:
+            conn.close()
+
+        if not envelopes:
+            return self._respond(404, {
+                "error": "not_found", "record_id": record_id,
+            })
+        more = len(envelopes) > limit
+        envelopes = envelopes[:limit]
+        return self._respond(200, {
+            "schema": "swf.sync.record_history.v1",
+            "record_id": record_id,
+            "envelopes": envelopes,
+            "more": more,
+        })
+
+    # Apply-result reason → HTTP status. Spec §4.4 + §9.6.
+    _SYNC_REASON_TO_STATUS = {
+        "shape_invalid": 400,
+        "kind_unknown": 400,
+        "envelope_too_large": 413,
+        "content_too_deep": 400,
+        "content_hash_mismatch": 400,
+        "author_not_in_cohort": 403,
+        "record_author_mismatch": 403,
+        "signature_invalid": 403,
+        "clock_too_far_ahead": 400,
+        "record_id_owned_by_other_author": 409,
+    }
+
+    def _do_sync_local_record_post(self) -> None:
+        """`POST /sync/local_record` — spec §7.4 / §9.5.
+
+        Agent-bearer-gated. The Electron app submits a record
+        edit; the server signs it with the local identity and
+        applies it. Returns the full signed envelope so the
+        Electron side can update its local view.
+
+        Body shape (input):
+            {"record_id": "amiller",
+             "record_type": "person",
+             "content": {...},
+             "prev_hash": "sha256:<hex>" | null}
+
+        The server:
+          1. Validates the agent-bearer token (loopback bypass).
+          2. Loads cohort-keys; if `record_id` is owned by some
+             OTHER pubkey, returns 403 `not_authorized_author`.
+          3. Computes wall_ts_ms = now, author_pubkey = identity.
+          4. Builds the envelope, signs, hashes content, runs
+             `apply_envelope`.
+          5. Returns the envelope at 201 (new) or 200 (replay).
+        """
+        from cryptography.hazmat.primitives import serialization
+
+        from swf.identity import get_or_create_identity
+        from swf.sync import (
+            SYNC_MAGIC,
+            apply_envelope,
+            load_cohort_keys_cached,
+        )
+        from swf.sync import (
+            canonicalize as _sync_canonicalize,
+        )
+        from swf.sync import (
+            content_hash as _sync_content_hash,
+        )
+        from swf.sync import (
+            ensure_schema as _sync_schema,
+        )
+        from swf.sync import (
+            sign_envelope as _sync_sign,
+        )
+
+        # 1. Agent-bearer token. Uses the same `_check_token` predicate
+        # as the existing search routes (loopback bypass, env-set
+        # bearer required otherwise) per spec §7.4.
+        if not self._check_token():
+            return self._respond(401, {"error": "unauthorized"})
+
+        # 2. Content-Type + size.
+        ctype_raw = self.headers.get("Content-Type") or ""
+        ctype = ctype_raw.split(";", 1)[0].strip().lower()
+        if ctype != "application/json":
+            return self._respond(415, {
+                "error": "unsupported_media_type",
+                "expected": "application/json",
+            })
+
+        try:
+            n = int(self.headers.get("Content-Length") or "0")
+        except ValueError:
+            n = 0
+        # Envelope cap applies post-canonicalization (we'll re-check
+        # after signing); but the input body MUST be smaller than the
+        # cap or it can't possibly fit. Pre-check before reading.
+        if n > self._SYNC_MAX_ENVELOPE_BYTES:
+            return self._respond(413, {
+                "error": "envelope_too_large",
+                "max_bytes": self._SYNC_MAX_ENVELOPE_BYTES,
+            })
+
+        body = self._read_json_body(max_bytes=self._SYNC_MAX_ENVELOPE_BYTES)
+        if not isinstance(body, dict):
+            return self._respond(400, {"error": "malformed_json"})
+
+        record_id = body.get("record_id")
+        record_type = body.get("record_type", "person")
+        content = body.get("content")
+        prev_hash = body.get("prev_hash")
+        if not isinstance(record_id, str) or not self._sync_record_id_valid(record_id):
+            return self._respond(400, {"error": "invalid_record_id"})
+        if not isinstance(record_type, str):
+            return self._respond(400, {"error": "invalid_record_type"})
+        if not isinstance(content, (dict, list)):
+            return self._respond(400, {"error": "invalid_content"})
+        if prev_hash is not None and not isinstance(prev_hash, str):
+            return self._respond(400, {"error": "invalid_prev_hash"})
+
+        # 3. Local identity → author_pubkey.
+        try:
+            ident = get_or_create_identity()
+        except Exception as exc:
+            return self._respond(500, {"error": "identity_unavailable",
+                                       "detail": str(exc)})
+        # Derive hex from the in-memory key — identity's public form is
+        # base64url; sync envelopes use ed25519:<hex>. Round-trip via
+        # cryptography's raw export.
+        pub_raw = ident.pub.public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw,
+        )
+        author_pubkey = "ed25519:" + pub_raw.hex()
+
+        # 4. Cohort-keys gate. Missing cohort → 503 `no_cohort_keys`
+        # (spec §8.2). Mismatched author → 403 `not_authorized_author`
+        # (the local pubkey doesn't match cohort-keys' expected author
+        # for this `record_id`).
+        cohort_keys = load_cohort_keys_cached()
+        if not cohort_keys:
+            return self._respond(503, {"error": "no_cohort_keys"})
+        expected = cohort_keys.pubkey_for_handle(record_id)
+        if expected is None:
+            # `record_id` isn't a known cohort handle. Accept iff this
+            # pubkey is at least cohort-known (the apply-side pin will
+            # gate further writes to the same record_id by other authors).
+            if not cohort_keys.is_known_pubkey(author_pubkey):
+                return self._respond(403, {"error": "author_not_in_cohort"})
+        elif expected != author_pubkey:
+            return self._respond(403, {
+                "error": "not_authorized_author",
+                "expected_pubkey": expected,
+            })
+
+        # 5. Build the envelope.
+        import time as _time
+        envelope: dict = {
+            "magic": SYNC_MAGIC,
+            "kind": record_type,
+            "record_id": record_id,
+            "author_pubkey": author_pubkey,
+            "wall_ts_ms": int(_time.time() * 1000),
+            "prev_hash": prev_hash,
+            "content": content,
+            "content_hash": _sync_content_hash(content),
+        }
+        envelope["signature"] = _sync_sign(envelope, priv=ident.priv)
+
+        # 6. Final envelope size check (the cap is on the canonical
+        # form, which is what apply_envelope uses anyway — but a
+        # 200/201 on a >64 KiB envelope after signing would be a
+        # contract bug).
+        if len(_sync_canonicalize(envelope, drop_signature=True)) > self._SYNC_MAX_ENVELOPE_BYTES:
+            return self._respond(413, {
+                "error": "envelope_too_large",
+                "max_bytes": self._SYNC_MAX_ENVELOPE_BYTES,
+            })
+
+        # 7. Apply.
+        try:
+            conn = self._open_sync_conn()
+        except sqlite3.OperationalError as exc:
+            return self._respond(500, {"error": "sync_store_unavailable",
+                                       "detail": str(exc)})
+        try:
+            _sync_schema(conn)
+            result = apply_envelope(conn, envelope, cohort_keys=cohort_keys)
+        finally:
+            conn.close()
+
+        if not result.ok:
+            status = self._SYNC_REASON_TO_STATUS.get(result.reason, 400)
+            return self._respond(status, {
+                "error": result.reason,
+                "record_id": record_id,
+            })
+
+        status = 201 if result.was_new else 200
+        return self._respond(status, {
+            "envelope": envelope,
+            "was_new": result.was_new,
+            "became_latest": result.became_latest,
+            "fork_detected": result.fork_detected,
+        })
+
     def do_POST(self):  # noqa: N802 (stdlib API)
         from urllib.parse import urlparse as _urlparse
         path = _urlparse(self.path).path
@@ -1445,6 +1841,16 @@ class _Handler(BaseHTTPRequestHandler):
         # propagate accepted bundles to peers from this dispatch site.
         if path == "/bundles":
             return self._do_bundles_post()
+
+        # ── Phase 2 sync: local-write route (docs/SYNC.md §7.4 / §9.5) ──
+        # Agent-bearer-gated. Body shape:
+        #     {"record_id": "...", "record_type": "person",
+        #      "content": {...}, "prev_hash": "sha256:<hex>"|null}
+        # The server computes `wall_ts_ms` + `author_pubkey`, signs
+        # with the local identity, runs the apply pipeline, and
+        # returns the full envelope on success.
+        if path == "/sync/local_record":
+            return self._do_sync_local_record_post()
 
         # ── #93 phase 5: hivemind sink (§4.3 of SHAPE-ROTATOR-OS-SPEC.md) ──
         # Voxterm clients post UNSIGNED transcript batches here; the
@@ -2474,7 +2880,32 @@ def _serve(argv: list[str]) -> int:
             logger.error("--hivemind-sink failed to start: %s", exc)
             return 1
 
+    # ── Phase 2 sync subsystem (docs/SYNC.md) ─────────────────────────
+    # Ensure the sync sqlite schema is in place BEFORE the HTTP server
+    # starts serving (so the first /sync/manifest request doesn't race
+    # the DDL). Then spawn the background sync loop as a daemon thread
+    # AFTER serve() begins listening — sync_loop polls peers, never
+    # blocks the request path.
+    #
+    # `SWF_SYNC_DISABLE=1` disables the loop entirely (spec §8.5);
+    # the HTTP routes still serve, but we never poll outbound. Used
+    # when the operator wants search/bundles only.
+    sync_disabled = os.environ.get("SWF_SYNC_DISABLE") in ("1", "true", "yes")
     try:
+        from swf.indrex import db_path as _idx_db
+        from swf.sync.schema import ensure_schema as _sync_ensure_schema
+        _conn = sqlite3.connect(str(_idx_db()), timeout=5.0)
+        try:
+            _sync_ensure_schema(_conn)
+        finally:
+            _conn.close()
+    except Exception as exc:
+        logger.warning("sync schema init skipped: %s", exc)
+
+    try:
+        if not sync_disabled:
+            from swf.sync.sync_loop import start_sync_loop
+            start_sync_loop()
         serve(args.bind, args.port)
     finally:
         # Stop the daemon-thread subsystems started by --full BEFORE
@@ -2487,6 +2918,10 @@ def _serve(argv: list[str]) -> int:
         # restart) unpredictable.
         if args.full:
             _stop_full_subsystems()
+        if not sync_disabled:
+            with contextlib.suppress(Exception):
+                from swf.sync.sync_loop import stop_sync_loop
+                stop_sync_loop()
         if mdns_handle is not None:
             with contextlib.suppress(Exception):
                 mdns_handle.stop()
