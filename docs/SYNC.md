@@ -1415,8 +1415,8 @@ truth.
 | --------------------- | ------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
 | `tick`                | End of every `sync_loop._tick()` iteration              | `visited`, `pulled`, `applied`, `duration_ms`                                                 |
 | `manifest_fetched`    | Per peer in `sync_with_peer` on a successful manifest fetch | `peer_pubkey`, `peer_url`, `record_count`                                                  |
-| `peer_unreachable`    | Per peer when the manifest fetch fails (network error, non-2xx, malformed response, or a crashing `sync_with_peer`) | `peer_pubkey`, `peer_url`, `reason`               |
-| `peer_reachable`      | On the FIRST successful manifest fetch after a prior `peer_unreachable` for the same pubkey (transition edge) | `peer_pubkey`, `peer_url`                       |
+| `peer_unreachable`    | On the `reachable → unreachable` transition (or the first-ever unreachable observation for a peer). Manifest-fetch failure on a peer that's already in the `unreachable` state is SILENT to avoid spamming the feed every tick while a peer sleeps. | `peer_pubkey`, `peer_url`, `reason`               |
+| `peer_reachable`      | On the `unreachable → reachable` transition (FIRST successful manifest fetch after a prior `peer_unreachable` for the same pubkey) | `peer_pubkey`, `peer_url`                       |
 | `pulled`              | Per envelope where `apply_envelope(...).was_new=True` from a remote pull | `peer_pubkey`, `peer_url`, `record_id`, `wall_ts_ms`, `content_hash`        |
 | `applied_local`       | On `POST /sync/local_record` returning 201              | `record_id`, `wall_ts_ms`, `content_hash`                                                     |
 
@@ -1429,10 +1429,17 @@ Notes:
   remote record_id.
 - `pulled` is emitted only for `was_new=True` apply results. Replays
   (`was_new=False`) would spam the feed.
-- `peer_reachable` is an **edge** event — it fires only on the
-  `unreachable → reachable` transition. The very first contact with a
-  peer never emits `peer_reachable`; the natural `manifest_fetched`
-  event suffices as a positive heartbeat.
+- Both `peer_reachable` and `peer_unreachable` are **edge** events as
+  of v0.12.1: each fires only on a state transition, never on the
+  steady-state observation. A peer that stays down across many sync
+  ticks emits exactly one `peer_unreachable` (when it first goes down)
+  and stays silent until it recovers (one `peer_reachable`). This
+  contains the renderer's traffic feed when a cohort member's laptop
+  closes for an hour. Implementation: see `_record_peer_status` in
+  `src/swf/sync/sync_loop.py` — the helper diffs the prior state and
+  only emits on change.
+- The very first contact with a peer never emits `peer_reachable`; the
+  natural `manifest_fetched` event suffices as a positive heartbeat.
 
 ### 12.5 `GET /sync/log`
 
