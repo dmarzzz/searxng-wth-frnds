@@ -344,6 +344,12 @@ def pull_from_peer(
     alchemists = _load_alchemists_cached()
 
     stored_total = 0
+    # Approximate bytes of new bundles ingested this pull — surfaced
+    # to the node event ring on success (docs/SYNC.md §13). Counted
+    # at insert time via `len(json.dumps(env))` so a verifier
+    # rejection or pre-existing cid (was_new=False) doesn't inflate
+    # the figure. Cheap relative to the verify+insert pipeline.
+    stored_bytes = 0
     # Channel-level reachability flags. Recorded once after the loop:
     # the first HTTP failure trips backoff; otherwise the first
     # successful fetch resets the counter. Per-bundle verify
@@ -417,6 +423,12 @@ def pull_from_peer(
                     continue
                 if was_new:
                     stored_total += 1
+                    # Defensive: the envelope round-tripped through
+                    # `verify_bundle`, so it's JSON-serializable in
+                    # practice. If it isn't, drop the byte count
+                    # rather than crashing the puller.
+                    with contextlib.suppress(TypeError, ValueError):
+                        stored_bytes += len(json.dumps(env).encode("utf-8"))
 
             # Advance high-water using the response's
             # `next_received_since`. Contract (server side, in
@@ -479,6 +491,25 @@ def pull_from_peer(
                 "record_pull_success crashed for %s: %s",
                 peer.pubkey[:12], exc,
             )
+
+    # Surface successful bundle pulls on the unified node event ring
+    # (docs/SYNC.md §13). Emit only when at least one new bundle was
+    # ingested — `stored_total=0` is the steady state.
+    if stored_total > 0:
+        try:
+            from swf.sync.event_log import emit_node_event
+            emit_node_event(
+                "bundle_pulled",
+                category="ingest",
+                peer_pubkey=peer.pubkey,
+                peer_url=base,
+                bundle_count=stored_total,
+                bytes=stored_bytes,
+            )
+        except Exception:
+            # Event emission must never break the puller's
+            # accounting; the return value is the source of truth.
+            pass
 
     return stored_total
 

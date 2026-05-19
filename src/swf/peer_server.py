@@ -471,6 +471,12 @@ class _Handler(BaseHTTPRequestHandler):
             return self._do_sync_manifest()
         if path == "/sync/log":
             return self._do_sync_log(parse_qs(parsed.query))
+        # Generalized node-wide event log (docs/SYNC.md §13). The
+        # `/sync/log` route above is the back-compat alias that
+        # forces `category=sync`; `/node/log` returns every
+        # category and supports a `?category=` CSV filter.
+        if path == "/node/log":
+            return self._do_node_log(parse_qs(parsed.query))
         if path.startswith("/sync/record/"):
             tail = path[len("/sync/record/"):]
             # `/sync/record/<id>` (current page) and
@@ -1526,12 +1532,56 @@ class _Handler(BaseHTTPRequestHandler):
             "manifest_hash": manifest["manifest_hash"],
         })
 
+    def _parse_event_log_qs(
+        self, qs: dict,
+    ) -> tuple[int | None, int | None, int] | tuple[int, dict]:
+        """Parse common cursor + limit query params shared by
+        `/sync/log` and `/node/log`.
+
+        Returns `(since_seq, since_ms, limit)` on success, or
+        `(status_code, error_body)` on failure — the caller forwards
+        the latter via `_respond`. This avoids two near-identical
+        validation blocks across the two handlers and keeps their
+        error contracts byte-for-byte identical.
+        """
+        since_seq: int | None = None
+        if "since_seq" in qs:
+            try:
+                since_seq = int((qs.get("since_seq") or ["0"])[0])
+            except ValueError:
+                return (400, {"error": "invalid_since_seq"})
+            if since_seq < 0:
+                return (400, {"error": "invalid_since_seq"})
+
+        since_ms: int | None = None
+        if "since_ms" in qs:
+            try:
+                since_ms = int((qs.get("since_ms") or ["0"])[0])
+            except ValueError:
+                return (400, {"error": "invalid_since_ms"})
+            if since_ms < 0:
+                return (400, {"error": "invalid_since_ms"})
+
+        limit_raw = (qs.get("limit") or [str(self._SYNC_LOG_DEFAULT_LIMIT)])[0]
+        try:
+            limit = int(limit_raw)
+        except ValueError:
+            return (400, {"error": "invalid_limit"})
+        if limit < 1:
+            return (400, {"error": "invalid_limit"})
+        if limit > self._SYNC_LOG_MAX_LIMIT:
+            limit = self._SYNC_LOG_MAX_LIMIT
+
+        return (since_seq, since_ms, limit)
+
     def _do_sync_log(self, qs: dict) -> None:
         """`GET /sync/log?since_seq=<int>&since_ms=<int>&limit=<int>`.
 
-        Read-only window onto the in-process sync event ring buffer
-        (docs/SYNC.md §12). The SROS renderer polls this for a live
-        "network activity" feed + per-peer heartbeat pulses.
+        Read-only window onto the in-process node event ring buffer
+        filtered to `category="sync"` (docs/SYNC.md §12). This is the
+        back-compat alias for `/node/log?category=sync`, retained so
+        SROS clients written against v0.11.3 keep seeing only sync
+        events with no breakage.
 
         No auth — same posture as `/sync/manifest`. The ring is
         per-process, restarts wipe it, so there's no durable data to
@@ -1548,41 +1598,19 @@ class _Handler(BaseHTTPRequestHandler):
             values clamp to 500.
         """
         from swf.identity import get_or_create_identity
-        from swf.sync.event_log import get_sync_events, tail_seq
+        from swf.sync.event_log import get_node_events, tail_seq
 
-        # since_seq — optional non-negative int.
-        since_seq: int | None = None
-        if "since_seq" in qs:
-            try:
-                since_seq = int((qs.get("since_seq") or ["0"])[0])
-            except ValueError:
-                return self._respond(400, {"error": "invalid_since_seq"})
-            if since_seq < 0:
-                return self._respond(400, {"error": "invalid_since_seq"})
+        parsed = self._parse_event_log_qs(qs)
+        if len(parsed) == 2:
+            status, body = parsed
+            return self._respond(status, body)
+        since_seq, since_ms, limit = parsed
 
-        # since_ms — optional non-negative int.
-        since_ms: int | None = None
-        if "since_ms" in qs:
-            try:
-                since_ms = int((qs.get("since_ms") or ["0"])[0])
-            except ValueError:
-                return self._respond(400, {"error": "invalid_since_ms"})
-            if since_ms < 0:
-                return self._respond(400, {"error": "invalid_since_ms"})
-
-        # limit — default + cap.
-        limit_raw = (qs.get("limit") or [str(self._SYNC_LOG_DEFAULT_LIMIT)])[0]
-        try:
-            limit = int(limit_raw)
-        except ValueError:
-            return self._respond(400, {"error": "invalid_limit"})
-        if limit < 1:
-            return self._respond(400, {"error": "invalid_limit"})
-        if limit > self._SYNC_LOG_MAX_LIMIT:
-            limit = self._SYNC_LOG_MAX_LIMIT
-
-        events = get_sync_events(
-            since_seq=since_seq, since_ms=since_ms, limit=limit,
+        events = get_node_events(
+            since_seq=since_seq,
+            since_ms=since_ms,
+            limit=limit,
+            categories=frozenset({"sync"}),
         )
         try:
             node_pubkey_b64 = get_or_create_identity().pub_b64
@@ -1591,6 +1619,73 @@ class _Handler(BaseHTTPRequestHandler):
 
         return self._respond(200, {
             "schema": "swf.sync.log.v1",
+            "node_pubkey": node_pubkey_b64,
+            "tail_seq": tail_seq(),
+            "events": events,
+        })
+
+    def _do_node_log(self, qs: dict) -> None:
+        """`GET /node/log?since_seq=<int>&since_ms=<int>&limit=<int>&category=<csv>`.
+
+        Unified node event ring (docs/SYNC.md §13). Returns events
+        across every category — sync, mdns, health, ingest, search,
+        error — that the daemon emitted during this process.
+
+        Same cursor + limit semantics as `/sync/log`. Adds an optional
+        `category` query param: a comma-separated list of categories
+        to include. Omitted → all categories. Unknown category names
+        are silently ignored (the response will simply have nothing
+        from them); we don't 400 on unknown values so a renderer
+        polling a node from a future version can opt into a category
+        before the node has anything to emit for it.
+
+        Response body:
+            {
+              "schema": "swf.node.log.v1",
+              "node_pubkey": "<own>",
+              "tail_seq": <highest>,
+              "events": [...]
+            }
+
+        No auth — same posture as `/sync/log`.
+        """
+        from swf.identity import get_or_create_identity
+        from swf.sync.event_log import get_node_events, tail_seq
+
+        parsed = self._parse_event_log_qs(qs)
+        if len(parsed) == 2:
+            status, body = parsed
+            return self._respond(status, body)
+        since_seq, since_ms, limit = parsed
+
+        # `?category=sync,mdns` → frozenset({"sync", "mdns"}).
+        # Absent → None → unfiltered (all categories returned).
+        # Empty (`?category=`) → also unfiltered, matches absent.
+        cat_filter: frozenset[str] | None = None
+        if "category" in qs:
+            raw_vals = qs.get("category") or []
+            tokens: list[str] = []
+            for raw in raw_vals:
+                for part in raw.split(","):
+                    p = part.strip()
+                    if p:
+                        tokens.append(p)
+            if tokens:
+                cat_filter = frozenset(tokens)
+
+        events = get_node_events(
+            since_seq=since_seq,
+            since_ms=since_ms,
+            limit=limit,
+            categories=cat_filter,
+        )
+        try:
+            node_pubkey_b64 = get_or_create_identity().pub_b64
+        except Exception:
+            node_pubkey_b64 = ""
+
+        return self._respond(200, {
+            "schema": "swf.node.log.v1",
             "node_pubkey": node_pubkey_b64,
             "tail_seq": tail_seq(),
             "events": events,
@@ -2023,7 +2118,29 @@ class _Handler(BaseHTTPRequestHandler):
             # error-rate panel learns there are bad runs to investigate.
             import time as _time
             _t0 = _time.monotonic()
+            _t0_ms = int(_time.time() * 1000)
             _ok = True
+
+            # Hash the query (truncated SHA-256) for the node event
+            # ring. We never emit the raw query string — the ring is
+            # a process-local debug surface, but a federated renderer
+            # might log it elsewhere and queries can be sensitive.
+            # See docs/SYNC.md §13 for the `search` category contract.
+            try:
+                import hashlib as _hashlib
+                _query_hash = _hashlib.sha256(q.encode("utf-8")).hexdigest()[:16]
+            except Exception:
+                _query_hash = ""
+            try:
+                from swf.sync.event_log import emit_node_event as _emit_node
+                _emit_node(
+                    "web_search_started",
+                    category="search",
+                    query_hash=_query_hash,
+                    started_at_ms=_t0_ms,
+                )
+            except Exception:
+                pass
             try:
                 from swf.search import web_search as _web_search
                 resp = _web_search(
@@ -2043,10 +2160,51 @@ class _Handler(BaseHTTPRequestHandler):
                     _cmet.record_search((_time.monotonic() - _t0) * 1000.0, ok=False)
                 except Exception:
                     pass
+                try:
+                    from swf.sync.event_log import emit_node_event as _emit_node
+                    _emit_node(
+                        "web_search_completed",
+                        category="search",
+                        query_hash=_query_hash,
+                        hit_count=0,
+                        duration_ms=int((_time.monotonic() - _t0) * 1000),
+                        source="error",
+                    )
+                except Exception:
+                    pass
                 return self._respond(500, {"error": "web_search failed"})
             try:
                 from swf.community_full import metrics as _cmet
                 _cmet.record_search((_time.monotonic() - _t0) * 1000.0, ok=_ok)
+            except Exception:
+                pass
+            # Emit `web_search_completed` for the renderer. We
+            # classify `source` as "federated" when the search
+            # actually crossed the network (`network_used=True`) and
+            # "local" otherwise — local cache, local indrex, or any
+            # path that resolved without an outbound request.
+            try:
+                payload = resp.to_json() if hasattr(resp, "to_json") else {}
+                results_field = payload.get("results") if isinstance(payload, dict) else None
+                hit_count = (
+                    len(results_field) if isinstance(results_field, list)
+                    else int(payload.get("results_count") or 0)
+                    if isinstance(payload, dict) else 0
+                )
+                network_used = bool(
+                    isinstance(payload, dict)
+                    and payload.get("network_used"),
+                )
+                source = "federated" if network_used else "local"
+                from swf.sync.event_log import emit_node_event as _emit_node
+                _emit_node(
+                    "web_search_completed",
+                    category="search",
+                    query_hash=_query_hash,
+                    hit_count=int(hit_count),
+                    duration_ms=int((_time.monotonic() - _t0) * 1000),
+                    source=source,
+                )
             except Exception:
                 pass
             return self._respond(200, resp.to_json())

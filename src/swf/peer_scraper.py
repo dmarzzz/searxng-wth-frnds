@@ -80,6 +80,28 @@ from . import identity
 logger = logging.getLogger(__name__)
 
 
+def _emit_node(
+    kind: str,
+    *,
+    category: str,
+    payload: dict | None = None,
+    **kwargs,
+) -> None:
+    """Fire an event onto the unified node event ring (docs/SYNC.md
+    §13). Best-effort: ring failures must never crash the scraper's
+    actual work.
+
+    Forwards `payload=` + `**kwargs` to `emit_node_event` with the
+    same semantics — use `payload=` when a field name collides with
+    the function signature (e.g. `kind`).
+    """
+    try:
+        from .sync.event_log import emit_node_event
+        emit_node_event(kind, category=category, payload=payload, **kwargs)
+    except Exception:
+        pass
+
+
 def _emit(kind: str, payload: dict) -> None:
     """Fire an event onto the indrex bus. Best-effort: a circular-import
     or a missing schema must never crash the scraper."""
@@ -1288,6 +1310,11 @@ def pull_from_peer(
             "page_count": 0,
             "declared_root": "", "computed_root": "",
         })
+        _emit_node(
+            "scraper_error", category="error",
+            peer_pubkey=peer.pubkey, peer_url=base,
+            error="liveness_check_failed",
+        )
         return (0, "liveness_check_failed")
     # P2P-review #2: detect epoch change via /index/cursor BEFORE
     # asking for the bundle. If the producer's epoch has rotated
@@ -1325,6 +1352,11 @@ def pull_from_peer(
             "page_count": 0,
             "declared_root": "", "computed_root": "",
         })
+        _emit_node(
+            "scraper_error", category="error",
+            peer_pubkey=peer.pubkey, peer_url=base,
+            error="http_error",
+        )
         return (0, "http_error")
     v = verify_bundle(bundle, expected_pubkey=peer.pubkey)
     if not v.ok:
@@ -1345,6 +1377,11 @@ def pull_from_peer(
             v.page_count,
             v.declared_root or "-",
             v.computed_root or "-",
+        )
+        _emit_node(
+            "scraper_error", category="error",
+            peer_pubkey=peer.pubkey, peer_url=base,
+            error=f"verify:{v.reason}",
         )
         return (0, f"verify:{v.reason}")
     bundle_epoch = bundle.get("epoch_id") or ""
@@ -1377,6 +1414,24 @@ def pull_from_peer(
         "pubkey": peer.pubkey, "nickname": peer.nickname,
         "stored": stored, "until": until,
     })
+    # Surface successful scraper pulls on the unified node event ring
+    # (docs/SYNC.md §13). Only emit when we actually ingested fresh
+    # rows — a `stored=0` tick is the steady state (peer is caught
+    # up) and would spam the feed.
+    #
+    # The `kind` field collides with `emit_node_event`'s positional
+    # parameter, so we route the payload through `payload=` — see
+    # event_log.emit_node_event docstring.
+    if stored > 0:
+        _emit_node(
+            "scraper_pulled", category="ingest",
+            payload={
+                "peer_pubkey": peer.pubkey,
+                "peer_url": base,
+                "count": stored,
+                "kind": "pages",
+            },
+        )
     return (stored, "ok")
 
 
