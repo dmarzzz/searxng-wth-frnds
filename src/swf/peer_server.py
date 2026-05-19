@@ -1491,7 +1491,8 @@ class _Handler(BaseHTTPRequestHandler):
         would otherwise apply envelopes (the POST path); GET is fine.
         """
         from swf.identity import get_or_create_identity
-        from swf.sync import build_manifest, ensure_schema as _sync_schema
+        from swf.sync import build_manifest
+        from swf.sync import ensure_schema as _sync_schema
 
         try:
             conn = self._open_sync_conn()
@@ -1527,6 +1528,8 @@ class _Handler(BaseHTTPRequestHandler):
         """
         from swf.sync import (
             ensure_schema as _sync_schema,
+        )
+        from swf.sync import (
             get_record_envelopes,
         )
 
@@ -1589,6 +1592,8 @@ class _Handler(BaseHTTPRequestHandler):
         """`GET /sync/record/<record_id>/history` — spec §7.2."""
         from swf.sync import (
             ensure_schema as _sync_schema,
+        )
+        from swf.sync import (
             get_record_history,
         )
 
@@ -1665,18 +1670,23 @@ class _Handler(BaseHTTPRequestHandler):
           5. Returns the envelope at 201 (new) or 200 (replay).
         """
         from cryptography.hazmat.primitives import serialization
-        from cryptography.hazmat.primitives.asymmetric.ed25519 import (
-            Ed25519PrivateKey,
-        )
 
         from swf.identity import get_or_create_identity
         from swf.sync import (
             SYNC_MAGIC,
             apply_envelope,
-            canonicalize as _sync_canonicalize,
-            content_hash as _sync_content_hash,
-            ensure_schema as _sync_schema,
             load_cohort_keys_cached,
+        )
+        from swf.sync import (
+            canonicalize as _sync_canonicalize,
+        )
+        from swf.sync import (
+            content_hash as _sync_content_hash,
+        )
+        from swf.sync import (
+            ensure_schema as _sync_schema,
+        )
+        from swf.sync import (
             sign_envelope as _sync_sign,
         )
 

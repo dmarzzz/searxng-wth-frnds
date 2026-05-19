@@ -61,10 +61,10 @@ def test_lww_tiebreaker_on_equal_ts(sync_conn, sync_keypair, make_envelope, coho
     content_hash wins."""
     cohort = cohort_keys_with(amiller=sync_keypair.pubkey_str)
     a = make_envelope(record_id="amiller", wall_ts_ms=1000, content={"a": 1})
-    b = make_envelope(record_id="amiller", wall_ts_ms=1000, content={"b": 2})
-    # NOTE: both have prev_hash=None, same author — that creates a fork!
-    # To test tiebreaker without fork, give them different prev_hashes.
-    # We'll create a v0 first then two siblings with different prev:
+    # NOTE: ms-tiebreaker only matters when prev_hash is equal too —
+    # otherwise the LWW query picks by `(wall_ts_ms DESC, content_hash
+    # DESC)` and prev_hash doesn't participate. We use sequential
+    # prev_hashes so this isn't a fork.
     apply_envelope(sync_conn, a, cohort_keys=cohort)
     # B is a fork sibling of A — same prev_hash (None), same record_id,
     # same author. apply_envelope handles fork; latest should NOT update.

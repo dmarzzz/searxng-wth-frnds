@@ -32,8 +32,8 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
 
 from .cohort_keys import load_cohort_keys_cached
 from .schema import ensure_schema

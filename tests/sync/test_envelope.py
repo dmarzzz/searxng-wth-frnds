@@ -25,7 +25,6 @@ from swf.sync import (
 )
 from swf.sync.envelope import validate_shape
 
-
 # ── canonicalize ──────────────────────────────────────────────────────
 
 
