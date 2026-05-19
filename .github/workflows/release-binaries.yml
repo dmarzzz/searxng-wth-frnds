@@ -124,12 +124,19 @@ jobs:
           # `pyrage` ships abi3 wheels and imports cleanly; no hidden-
           # import flag needed today. Re-add `--collect-all pyrage` if a
           # future version splits into submodules.
+          # `--collect-data swf` picks up non-Python data files shipped
+          # alongside the package (e.g. community_full/schema.sql, read
+          # at startup via Path(__file__).parent / "schema.sql"). Without
+          # this, the binary boots fine but crashes the first time the
+          # community_full subsystem tries to initialize its sqlite DB
+          # — i.e. every SWF_FULL=1 launch (which is how SROS bundles us).
           pyinstaller \
             --onefile \
             --clean \
             --noconfirm \
             --name "${{ steps.ver.outputs.asset }}" \
             --collect-submodules swf \
+            --collect-data swf \
             --collect-submodules zeroconf \
             --collect-submodules cryptography \
             --hidden-import swf.community_full \
@@ -165,7 +172,12 @@ jobs:
           # start (macOS "killed: 9", missing hidden-import, etc) the
           # health check will fail fast.
           tmpcwd="$(mktemp -d)"
-          (cd "$tmpcwd" && "$binary" --bind 127.0.0.1 --port "$port" --no-mdns) > server.log 2>&1 &
+          # `--full` exercises the aggregator subsystem (community_full
+          # init reads schema.sql, hivemind boots, bundles tables get
+          # ensured). This is exactly what SROS spawns with — anything
+          # that breaks under --full but works without it (e.g. missing
+          # data files in the PyInstaller bundle) MUST fail this gate.
+          (cd "$tmpcwd" && "$binary" --bind 127.0.0.1 --port "$port" --no-mdns --full) > server.log 2>&1 &
           pid=$!
           # Wait up to ~10s for the socket to come up.
           for i in $(seq 1 50); do
