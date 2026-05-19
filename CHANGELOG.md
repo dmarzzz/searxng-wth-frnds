@@ -4,6 +4,43 @@ All notable changes to this project will be documented here. The
 format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.0] — 2026-05-19
+
+### Added
+- **`SWF_TRUST_LAN_PEERS`** env var (opt-in) — enables **LAN-trust
+  mode** for single-user multi-device deployments (e.g. Shape Rotator
+  OS installed on two personal laptops on the same WiFi). When set,
+  the daemon:
+  1. Bypasses the cohort-keys gate in `POST /sync/local_record` — the
+     envelope is still self-signed by the local identity but
+     `author_pubkey` is not cross-checked against `cohort-keys.json`.
+  2. Relaxes single-writer-pinning in `apply_envelope`: any signed
+     envelope from any author may write any `record_id`, multiple
+     authors per record are accepted as a multi-writer chain, and
+     no fork warnings are emitted. LWW by `wall_ts_ms` applies
+     normally.
+  3. Bypasses the cohort-keys whitelist on the incoming sync pull
+     path (`sync_loop`) — every mDNS-discovered peer is contacted
+     and every signed envelope is candidate for apply.
+  - **Not bypassed**: ed25519 signature verification. Unsigned or
+    tampered envelopes are still rejected with `signature_invalid`.
+- **`swf.sync.is_lan_trust_mode()`** module-level helper, re-read on
+  every gate check (no daemon restart required to flip the flag).
+- **`docs/SYNC.md` §11** — operator-facing description: motivation,
+  semantics table, security tradeoff (anyone on your LAN can write
+  anything to your store), forward migration path to the planned
+  multi-pubkey-per-handle cohort-keys extension.
+- **`tests/sync/test_lan_trust_mode.py`** — 10 new tests covering
+  truthy-value parsing, single-writer-pin relaxation, fork suppression,
+  signature-verify-still-enforced, regression baselines for strict
+  mode, `POST /sync/local_record` HTTP flow, and a two-peer
+  integration scenario with no shared cohort-keys.
+
+### Notes
+- LAN-trust mode is **opt-in** via the env var; default behavior is
+  unchanged. All 50 Phase 2 sync tests from v0.10.0 still pass
+  without `SWF_TRUST_LAN_PEERS` set.
+
 ## [0.8.0] — 2026-05-02
 
 First public release. This version is the cumulative result of the

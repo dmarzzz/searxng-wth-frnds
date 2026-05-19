@@ -35,7 +35,8 @@ import urllib.request
 from collections.abc import Callable
 from pathlib import Path
 
-from .cohort_keys import load_cohort_keys_cached
+from . import is_lan_trust_mode
+from .cohort_keys import CohortKeys, load_cohort_keys_cached
 from .schema import ensure_schema
 from .store import apply_envelope, build_manifest
 
@@ -120,11 +121,20 @@ def sync_with_peer(
       4. Sequential — we don't fan out parallel pulls. The puller side
          is bounded; one round-trip per record.
     """
+    lan_trust = is_lan_trust_mode()
     if cohort_keys is None:
         cohort_keys = load_cohort_keys_cached()
-    if not cohort_keys:
+    if not cohort_keys and not lan_trust:
         # No cohort known → nothing we'd accept. Skip the peer.
+        # LAN-trust mode bypasses this: any signed envelope from any
+        # discovered peer is acceptable, cohort-keys is unused
+        # (spec §11).
         return (0, 0)
+    if cohort_keys is None:
+        # LAN-trust on but no cohort file at all → pass an empty
+        # CohortKeys placeholder; apply_envelope ignores it under
+        # LAN-trust.
+        cohort_keys = CohortKeys()
 
     base = peer_url.rstrip("/")
     remote = _http_get_json(f"{base}/sync/manifest")
@@ -256,7 +266,13 @@ def _mark_peer_attempt(peer_key: str, *, now: float) -> None:
 
 
 def _default_discover() -> list[tuple[str, str | None]]:
-    """Production peer discovery: cohort-keys ∩ `discover_all_peers()`."""
+    """Production peer discovery: cohort-keys ∩ `discover_all_peers()`.
+
+    In LAN-trust mode (`SWF_TRUST_LAN_PEERS=1`, spec §11) the cohort
+    filter is skipped — every mDNS-discovered peer is included
+    verbatim. The apply pipeline still verifies signatures on every
+    pulled envelope.
+    """
     try:
         from swf.discovery import discover_all_peers
     except Exception as exc:
@@ -267,6 +283,16 @@ def _default_discover() -> list[tuple[str, str | None]]:
     except Exception as exc:
         logger.error("discover_all_peers raised: %s", exc)
         return []
+
+    if is_lan_trust_mode():
+        # LAN-trust: trust every discovered peer. The apply path
+        # accepts any signed envelope, so cohort filtering would only
+        # block useful sync attempts.
+        return [
+            (getattr(p, "url", ""), getattr(p, "pubkey", None))
+            for p in peers
+            if getattr(p, "url", "")
+        ]
 
     cohort = load_cohort_keys_cached()
     cohort_pubkeys = cohort.pubkeys if cohort else frozenset()
@@ -341,11 +367,19 @@ def _tick(
     try:
         ensure_schema(conn)
         cohort_keys = load_cohort_keys_cached()
-        if not cohort_keys:
+        lan_trust = is_lan_trust_mode()
+        if not cohort_keys and not lan_trust:
             # Spec §8.2: missing cohort-keys is not a daemon failure.
             # We still tick; the loop just no-ops. Logging here would
             # be too spammy at 30s — `_default_discover` already logs.
+            # LAN-trust mode (§11) keeps the loop running with an
+            # empty cohort — every signed peer is acceptable.
             return
+        if cohort_keys is None or not cohort_keys:
+            # LAN-trust path: hand `sync_with_peer` a placeholder
+            # cohort so it doesn't fall through its own no-cohort
+            # early-exit.
+            cohort_keys = CohortKeys()
         now = time.time()
         for url, pubkey in peers:
             peer_key = pubkey or url

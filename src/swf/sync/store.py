@@ -35,6 +35,9 @@ from .envelope import (
 )
 from .schema import ensure_schema
 
+# Imported lazily inside `apply_envelope` to keep the circular-import
+# surface small — `__init__.py` re-exports from this module.
+
 logger = logging.getLogger(__name__)
 
 # Clock-skew window: envelopes more than 5 minutes in the future are
@@ -353,7 +356,25 @@ def apply_envelope(
 
     `clock_skew_ms` defaults to 5 min per §9.4; tests inject a small
     value to exercise the reject path deterministically.
+
+    LAN-trust mode (spec §11; `SWF_TRUST_LAN_PEERS=1`) relaxes two
+    gates:
+      * Step 2 (author whitelist): any author_pubkey accepted.
+      * Step 3 (single-writer pin) and step 7 (fork detection): the
+        first-write pin is still recorded for history, but a sibling
+        envelope from a different author is accepted as part of the
+        chain rather than rejected with `record_id_owned_by_other_author`
+        or flagged with `RECORD_FORK_DETECTED`. Multiple authors per
+        record_id are valid; LWW by wall_ts_ms still applies.
+    Signature verification (step 4) is NEVER skipped — that's the
+    wire-integrity check.
     """
+    # Re-read env on every call so tests + operators can flip the flag
+    # at runtime without bouncing the daemon. Import is lazy to avoid
+    # a circular reference (`__init__.py` re-exports from this module).
+    from . import is_lan_trust_mode
+    lan_trust = is_lan_trust_mode()
+
     if now_ms is None:
         now_ms = _now_ms()
 
@@ -367,14 +388,26 @@ def apply_envelope(
     wall_ts_ms = int(envelope["wall_ts_ms"])
     ch = envelope["content_hash"]
 
-    # 2. Author whitelist.
-    if not cohort_keys.is_known_pubkey(author_pubkey):
+    # 2. Author whitelist. Bypassed in LAN-trust mode (§11) — any
+    # signed envelope from any peer is acceptable. Signature verify
+    # below remains the wire-integrity gate.
+    if not lan_trust and not cohort_keys.is_known_pubkey(author_pubkey):
         return ApplyResult(ok=False, reason="author_not_in_cohort", content_hash=ch)
 
     # Schema must exist before we touch the tables.
     ensure_schema(conn)
 
     # 3. Record-author pin / collision check.
+    #
+    # Default mode (§9.6): the first author observed for a `record_id`
+    # is pinned; subsequent writes from a different author are
+    # rejected with `record_id_owned_by_other_author`.
+    #
+    # LAN-trust mode (§11): we still record the first author so the
+    # `sync_record_authors` table reflects history, but a different
+    # author claiming the same record_id is NOT rejected — multiple
+    # authors per record_id are valid. The pin row is left at the
+    # first observer's pubkey (informational only).
     pinned = _pinned_author_row(conn, record_id)
     if pinned is None:
         # First-observation pin. Spec §9.6: also enforce that this
@@ -386,7 +419,7 @@ def apply_envelope(
         _pin_author(conn, record_id, author_pubkey, now_ms)
     else:
         pinned_pubkey, _was_forked = pinned
-        if pinned_pubkey != author_pubkey:
+        if pinned_pubkey != author_pubkey and not lan_trust:
             return ApplyResult(
                 ok=False,
                 reason="record_id_owned_by_other_author",
@@ -408,22 +441,30 @@ def apply_envelope(
     # know if this envelope creates a new fork; the existing-fork case
     # is also covered (we still persist the envelope; build_manifest
     # suppresses outbound).
+    #
+    # LAN-trust mode (§11): fork detection is a single-writer-per-record
+    # concept. Since LAN-trust allows multiple authors per record_id,
+    # the notion of "fork" doesn't apply — all entries are part of one
+    # multi-author chain reconciled by LWW. We skip the sibling query
+    # and never set `fork_detected`.
     prev_hash = envelope.get("prev_hash")
     fork_detected = False
-    try:
-        siblings = conn.execute(
-            "SELECT content_hash FROM sync_records "
-            "WHERE record_id=? AND author_pubkey=? AND "
-            "      ((prev_hash IS NULL AND ? IS NULL) OR prev_hash=?)",
-            (record_id, author_pubkey, prev_hash, prev_hash),
-        ).fetchall()
-    except sqlite3.OperationalError:
-        siblings = []
-    sibling_hashes = {s[0] for s in siblings}
-    # A sibling with a different content_hash IS a fork. (Same-hash
-    # is just dedup, handled below.)
-    if any(h != ch for h in sibling_hashes):
-        fork_detected = True
+    sibling_hashes: set[str] = set()
+    if not lan_trust:
+        try:
+            siblings = conn.execute(
+                "SELECT content_hash FROM sync_records "
+                "WHERE record_id=? AND author_pubkey=? AND "
+                "      ((prev_hash IS NULL AND ? IS NULL) OR prev_hash=?)",
+                (record_id, author_pubkey, prev_hash, prev_hash),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            siblings = []
+        sibling_hashes = {s[0] for s in siblings}
+        # A sibling with a different content_hash IS a fork. (Same-hash
+        # is just dedup, handled below.)
+        if any(h != ch for h in sibling_hashes):
+            fork_detected = True
 
     # 8. Insert (idempotent on (record_id, content_hash)).
     envelope_json = canonicalize(envelope, drop_signature=False).decode("utf-8")
