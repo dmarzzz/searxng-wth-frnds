@@ -151,31 +151,23 @@ def sync_with_peer(
 
     remote = _http_get_json(f"{base}/sync/manifest")
     if not isinstance(remote, dict):
-        emit_node_event(
-            "peer_unreachable",
-            category="health",
-            peer_pubkey=peer_label,
-            peer_url=base,
-            reason="manifest_fetch_failed",
-        )
+        # _record_peer_status emits `peer_unreachable` ONLY on the
+        # reachable→unreachable transition (or first-ever observation),
+        # so a peer that stays down across many ticks no longer floods
+        # the traffic feed.
         _record_peer_status(
             peer_key, "unreachable",
             peer_url=base, peer_pubkey=peer_label,
+            reason="manifest_fetch_failed",
         )
         return (0, 0)
 
     remote_records = remote.get("records")
     if not isinstance(remote_records, dict):
-        emit_node_event(
-            "peer_unreachable",
-            category="health",
-            peer_pubkey=peer_label,
-            peer_url=base,
-            reason="malformed_manifest",
-        )
         _record_peer_status(
             peer_key, "unreachable",
             peer_url=base, peer_pubkey=peer_label,
+            reason="malformed_manifest",
         )
         return (0, 0)
 
@@ -316,14 +308,15 @@ def _record_peer_status(
     peer_pubkey: str,
     reason: str | None = None,
 ) -> None:
-    """Update `_peer_status[peer_key]` and emit a transition event.
+    """Update `_peer_status[peer_key]` and emit transition events.
 
-    Only emits `peer_reachable` on `unreachable → reachable`. The
-    `peer_unreachable` event is emitted independently at the fetch
-    site (so we capture the reason there); this helper just records
-    the new status so the next reachable observation can emit the
-    edge event. We do NOT emit `peer_unreachable` here — that fires
-    in-line where the failure is observed.
+    Emits `peer_unreachable` ONLY on `reachable → unreachable` (or the
+    first-ever unreachable observation for a peer). Emits
+    `peer_reachable` ONLY on `unreachable → reachable`. Same-state
+    observations (e.g. unreachable → unreachable on every tick when a
+    peer stays down) are SILENT — the renderer's traffic feed would
+    otherwise drown in repeats while the user's other-mac sleeps for
+    an hour.
     """
     with _peer_status_lock:
         prev = _peer_status.get(peer_key)
@@ -335,10 +328,19 @@ def _record_peer_status(
             peer_pubkey=peer_pubkey,
             peer_url=peer_url,
         )
-    # `unreachable` after a prior `reachable`: the
-    # `peer_unreachable` event is already emitted by the fetch
-    # site; we don't double-emit here.
-    _ = reason  # reserved for future structured transition reasons
+    elif new_status == "unreachable" and prev != "unreachable":
+        # First time we observe a peer down — or it was previously
+        # reachable and just went down. Either way, this is the edge
+        # transition worth surfacing. Subsequent ticks that keep
+        # finding it down don't re-emit; the renderer keeps it dimmed
+        # until a `peer_reachable` event clears the down state.
+        emit_node_event(
+            "peer_unreachable",
+            category="health",
+            peer_pubkey=peer_pubkey,
+            peer_url=peer_url,
+            reason=reason or "unreachable",
+        )
 
 
 def reset_peer_status_for_tests() -> None:
@@ -509,20 +511,14 @@ def _tick(
                 )
             except Exception as exc:
                 logger.error("sync_with_peer(%s) failed: %s", url, exc)
-                # Defensive: emit unreachable so the renderer's
-                # feed reflects a crashed iteration. The normal
-                # manifest-failure path emits inside
-                # `sync_with_peer` itself.
-                emit_node_event(
-                    "peer_unreachable",
-                    category="health",
-                    peer_pubkey=pubkey or "",
-                    peer_url=url,
-                    reason="sync_with_peer_crashed",
-                )
+                # Defensive: mark the peer unreachable. _record_peer_status
+                # emits the `peer_unreachable` event only on the
+                # reachable→unreachable transition, so repeated crashes
+                # across consecutive ticks don't spam the feed.
                 _record_peer_status(
                     peer_key, "unreachable",
                     peer_url=url, peer_pubkey=pubkey or "",
+                    reason="sync_with_peer_crashed",
                 )
                 continue
             pulled_total += pulled
