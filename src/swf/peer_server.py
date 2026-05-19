@@ -3689,6 +3689,24 @@ def _start_full_subsystems(*, own_pubkey: str | None = None,
         "FULL NODE: /graph, /events, /metrics/* live on "
         "the same port as the peer",
     )
+    # Provision the indrex.db schema (pages FTS5 + pages_meta + peers
+    # + events + kv + page_contributors + bundles). These tables are
+    # otherwise created lazily by first-write paths; without this an
+    # empty node 500s on /graph (read of `pages` before any write) and
+    # 500s on /events (read of `events` before any emitter). Idempotent.
+    try:
+        from swf.bundles import store as _bundles_store
+        from swf.search import migration as _migration
+        from swf.web import index as _web_index
+        conn = _web_index._conn()
+        try:
+            _migration.ensure_schema(conn)
+            _bundles_store.ensure_schema(conn)
+        finally:
+            conn.close()
+        logger.info("indrex schema provisioned (pages, peers, bundles, events)")
+    except Exception as exc:
+        logger.warning("indrex schema provisioning skipped: %s", exc)
     # Issue #43 PR A: indrex peer-scraper. Walks indrex.peers every
     # 60s, pulls each peer's /index/pages bundle, verifies + ingests.
     try:
