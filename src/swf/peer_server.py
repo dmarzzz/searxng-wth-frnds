@@ -1674,7 +1674,9 @@ class _Handler(BaseHTTPRequestHandler):
         from swf.identity import get_or_create_identity
         from swf.sync import (
             SYNC_MAGIC,
+            CohortKeys,
             apply_envelope,
+            is_lan_trust_mode,
             load_cohort_keys_cached,
         )
         from swf.sync import (
@@ -1754,21 +1756,34 @@ class _Handler(BaseHTTPRequestHandler):
         # (spec §8.2). Mismatched author → 403 `not_authorized_author`
         # (the local pubkey doesn't match cohort-keys' expected author
         # for this `record_id`).
-        cohort_keys = load_cohort_keys_cached()
-        if not cohort_keys:
-            return self._respond(503, {"error": "no_cohort_keys"})
-        expected = cohort_keys.pubkey_for_handle(record_id)
-        if expected is None:
-            # `record_id` isn't a known cohort handle. Accept iff this
-            # pubkey is at least cohort-known (the apply-side pin will
-            # gate further writes to the same record_id by other authors).
-            if not cohort_keys.is_known_pubkey(author_pubkey):
-                return self._respond(403, {"error": "author_not_in_cohort"})
-        elif expected != author_pubkey:
-            return self._respond(403, {
-                "error": "not_authorized_author",
-                "expected_pubkey": expected,
-            })
+        #
+        # LAN-trust mode (spec §11; `SWF_TRUST_LAN_PEERS=1`) skips
+        # the cohort-keys gate entirely. The envelope is still
+        # self-signed by the local identity (`author_pubkey` derived
+        # above), the agent-bearer token is still required, and the
+        # apply-path signature verify is still run. The only thing
+        # bypassed is the "is this handle's pubkey known?" check.
+        lan_trust = is_lan_trust_mode()
+        if lan_trust:
+            # Hand `apply_envelope` a placeholder cohort — its own
+            # whitelist gate is bypassed too in LAN-trust mode.
+            cohort_keys = CohortKeys()
+        else:
+            cohort_keys = load_cohort_keys_cached()
+            if not cohort_keys:
+                return self._respond(503, {"error": "no_cohort_keys"})
+            expected = cohort_keys.pubkey_for_handle(record_id)
+            if expected is None:
+                # `record_id` isn't a known cohort handle. Accept iff this
+                # pubkey is at least cohort-known (the apply-side pin will
+                # gate further writes to the same record_id by other authors).
+                if not cohort_keys.is_known_pubkey(author_pubkey):
+                    return self._respond(403, {"error": "author_not_in_cohort"})
+            elif expected != author_pubkey:
+                return self._respond(403, {
+                    "error": "not_authorized_author",
+                    "expected_pubkey": expected,
+                })
 
         # 5. Build the envelope.
         import time as _time

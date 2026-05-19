@@ -23,6 +23,8 @@ modules touch this code.
 """
 from __future__ import annotations
 
+import os
+
 from .cohort_keys import (
     CohortKeys,
     load_cohort_keys,
@@ -51,6 +53,48 @@ from .store import (
     pinned_author,
 )
 
+# ── LAN-trust mode (spec §11) ─────────────────────────────────────────
+#
+# Opt-in dev flag for single-user multi-device deployments (e.g. Shape
+# Rotator OS on two personal laptops on the same WiFi). When set, the
+# daemon:
+#   1. Bypasses the cohort-keys gate for local-record writes
+#      (POST /sync/local_record). The envelope is still self-signed by
+#      the local identity, just not cross-checked against the cohort.
+#   2. Skips single-writer-pinning in `apply_envelope`. Any cohort
+#      member (or any signed peer in LAN-trust mode) may write any
+#      record_id; multiple authors per record_id are accepted as a
+#      chain, LWW by wall_ts_ms applies normally, no fork warnings.
+#   3. Bypasses the cohort-keys author whitelist for incoming sync
+#      (sync_loop pull path). Any signed envelope from any discovered
+#      peer is acceptable.
+#
+# What is NOT bypassed: ed25519 signature verification. Unsigned or
+# tampered envelopes are still rejected — that's the wire-integrity
+# check, not the access-control check.
+#
+# Security tradeoff: anyone on your LAN with knowledge of your
+# `/sync/local_record` agent-bearer token, or any peer they can stand up
+# on the LAN that your node will discover via mDNS, can write any record
+# to your store. Use only on trusted networks.
+
+_LAN_TRUST_TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+
+def is_lan_trust_mode() -> bool:
+    """Return True iff `SWF_TRUST_LAN_PEERS` is set to a truthy value.
+
+    Truthy values (case-insensitive): ``1``, ``true``, ``yes``, ``on``.
+    Any other value (including empty / unset) means LAN-trust is off
+    and the cohort-keys gate + single-writer pin remain in force.
+
+    Re-read on every call — tests and operators can flip the flag at
+    runtime without bouncing the daemon (the env-var read is cheap and
+    every gate site consults this function fresh).
+    """
+    return (os.environ.get("SWF_TRUST_LAN_PEERS") or "").strip().lower() in _LAN_TRUST_TRUTHY
+
+
 __all__ = [
     "ApplyResult",
     "CohortKeys",
@@ -65,6 +109,7 @@ __all__ = [
     "envelope_hash",
     "get_record_envelopes",
     "get_record_history",
+    "is_lan_trust_mode",
     "is_record_forked",
     "latest_envelope",
     "load_cohort_keys",

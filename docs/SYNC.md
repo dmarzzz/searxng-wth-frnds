@@ -1187,6 +1187,159 @@ within one polling tick.
 
 ---
 
+## 11. LAN-trust mode
+
+> Added in v0.11.0. Opt-in dev flag for single-user multi-device
+> deployments. **Not for production cohorts.**
+
+### 11.1 Motivation
+
+The cohort-keys gate (§4.4 step 3, §8.2) and the single-writer pin
+(§9.6) are the right defaults for a multi-user cohort where each
+handle has a stable owner and writes must not collide. They are too
+strict for the most common Shape Rotator OS testing scenario today:
+
+> A single user has SROS installed on multiple personal laptops on
+> the same WiFi. Each laptop runs its own swf-node with its own
+> Ed25519 keypair. The user wants any peer they discover via mDNS
+> on the LAN to be trusted to write any record.
+
+The proper long-term fix is **multi-pubkey-per-handle in cohort-keys**
+(§8.2 extended so each handle carries a list of authorized pubkeys
+rather than a single one). That's a bigger change for a follow-up
+release. LAN-trust mode is the simpler dev-mode flag that unblocks the
+two-laptop testing path today.
+
+### 11.2 Activation
+
+Set the env var `SWF_TRUST_LAN_PEERS=1` (or `true`, `yes`, `on` —
+case-insensitive) on the swf-node process. Re-read on every gate
+check; no daemon restart required.
+
+```bash
+SWF_TRUST_LAN_PEERS=1 swf-node
+```
+
+The `swf.sync.is_lan_trust_mode()` helper is the single source of
+truth — every gate site consults it fresh.
+
+### 11.3 Semantics
+
+When LAN-trust is on, the daemon relaxes **three** gates and keeps
+**one**:
+
+| Gate                                                          | Default mode | LAN-trust mode |
+| ------------------------------------------------------------- | ------------ | -------------- |
+| Envelope shape + size + content-hash (§3.5, §4.4 steps 1–2,6) | enforced     | enforced       |
+| **Cohort-keys author whitelist** (§4.4 step 3, §8.2)          | enforced     | **bypassed**   |
+| **Single-writer-pin per record_id** (§4.4 step 4, §9.6)       | enforced     | **bypassed**   |
+| **Fork detection** (§9.9)                                     | active       | **suspended**  |
+| **Ed25519 signature verify** (§4.4 step 5)                    | enforced     | **enforced**   |
+| Clock-skew window (§4.4 step 7, §9.4)                         | enforced     | enforced       |
+| Replay dedup on `(record_id, content_hash)` (§5.3, §9.10)     | active       | active         |
+
+Concretely:
+
+1. **`POST /sync/local_record`** (§7.4) skips the cohort-keys gate.
+   The `author_pubkey` is still derived from the local identity and
+   the envelope is still self-signed, the agent-bearer token is
+   still required, and the apply-path signature verify still runs.
+   The 503 `no_cohort_keys` and 403 `not_authorized_author` /
+   `author_not_in_cohort` responses are not emitted in this mode.
+
+2. **`apply_envelope`** (§4.4) accepts an envelope from any
+   `author_pubkey` that produces a valid signature. The
+   `sync_record_authors` row is still inserted on first observation
+   (informational), but a later envelope from a different author
+   for the same `record_id` is **accepted as part of the chain**
+   rather than rejected with `record_id_owned_by_other_author`.
+   LWW by `(wall_ts_ms, content_hash)` applies normally — the
+   latest write wins regardless of which key signed it.
+
+3. **Fork detection** (§9.9) is suspended. The notion of a fork is a
+   single-writer-per-record concept; once we allow multiple authors
+   per `record_id` the sibling query is meaningless. No
+   `RECORD_FORK_DETECTED` log line is emitted, no `forked=1` flag
+   is set, and `build_manifest` does not suppress the record.
+
+4. **`sync_loop`** (§4.3) drops the cohort-keys filter on peer
+   discovery and on the apply path. Every mDNS-discovered peer is
+   contacted; every signed envelope from any peer is candidate for
+   apply. The pull path still runs the full shape + signature
+   pipeline on each envelope.
+
+### 11.4 Security tradeoff
+
+> **Anyone on your LAN can write anything to your store.**
+
+The cohort-keys file is the access-control root in the default mode
+— without it, a hostile peer on the same WiFi can send a signed
+envelope with their own keypair claiming to be `amiller` and your
+store will accept it (since signature verify passes and there is no
+allowlist to consult).
+
+You should run LAN-trust mode **only when**:
+
+- The LAN you are connected to is trusted (home WiFi, personal
+  hotspot, isolated lab VLAN). The threat surface is anyone with
+  L2 reach who can answer mDNS queries.
+- You are deploying SROS on devices you personally own and the
+  intent is "auto-merge across my laptops" rather than "share with
+  others."
+- The data you are syncing is not so sensitive that an untrusted
+  observer rebroadcasting a forged envelope would matter.
+
+Do **NOT** run LAN-trust on:
+
+- Coffee-shop WiFi or any open access point.
+- Office / co-working networks where you don't control L2.
+- Networks where you ship swf-node bound to `0.0.0.0`. (Default
+  bind is loopback, but if you've reverse-proxied with no auth in
+  front, LAN-trust expands the attack surface.)
+
+### 11.5 Migration path
+
+When the multi-pubkey-per-handle cohort-keys extension lands
+(tracked in the follow-up issue), the proper deployment pattern for
+"my two laptops" becomes:
+
+```json
+{
+  "schema": "swf.cohort_keys.v2",
+  "members": [
+    {"handle": "myself",
+     "pubkeys": ["ed25519:<laptop1>", "ed25519:<laptop2>"]}
+  ]
+}
+```
+
+…and `SWF_TRUST_LAN_PEERS` is no longer needed for that scenario. We
+keep the flag in v0.11+ for legitimate dev / debugging use cases
+(integration tests, ephemeral demo nets) but the typical path
+graduates back to the cohort-keys gate.
+
+### 11.6 Test coverage
+
+`tests/sync/test_lan_trust_mode.py` covers:
+
+- `is_lan_trust_mode()` truthy / falsy value parsing.
+- `apply_envelope` accepts an unknown-author envelope under
+  LAN-trust; same envelope is rejected with `author_not_in_cohort`
+  without LAN-trust.
+- Two envelopes from different keys for the same `record_id` are
+  both stored, no fork is set, LWW picks the higher-`wall_ts_ms`
+  winner.
+- Sibling envelopes (same `prev_hash`, different `content_hash`)
+  are accepted as a chain — no `RECORD_FORK_DETECTED`.
+- Tampered envelope is still rejected with `signature_invalid`.
+- `POST /sync/local_record` returns 201 (not 503) under LAN-trust
+  with no cohort-keys file present.
+- Two-peer integration: peer A and peer B with separate identities
+  and **no shared cohort-keys** successfully sync a record via
+  `sync_with_peer` under LAN-trust.
+
+---
+
 ## Appendix A: cross-references
 
 - `DESIGN.md` — `src/swf/` module map; sync code lives under
