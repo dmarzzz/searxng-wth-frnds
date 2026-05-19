@@ -37,7 +37,7 @@ from pathlib import Path
 
 from . import is_lan_trust_mode
 from .cohort_keys import CohortKeys, load_cohort_keys_cached
-from .event_log import emit_sync_event
+from .event_log import emit_node_event, emit_sync_event
 from .schema import ensure_schema
 from .store import apply_envelope, build_manifest
 
@@ -151,8 +151,9 @@ def sync_with_peer(
 
     remote = _http_get_json(f"{base}/sync/manifest")
     if not isinstance(remote, dict):
-        emit_sync_event(
+        emit_node_event(
             "peer_unreachable",
+            category="health",
             peer_pubkey=peer_label,
             peer_url=base,
             reason="manifest_fetch_failed",
@@ -165,8 +166,9 @@ def sync_with_peer(
 
     remote_records = remote.get("records")
     if not isinstance(remote_records, dict):
-        emit_sync_event(
+        emit_node_event(
             "peer_unreachable",
+            category="health",
             peer_pubkey=peer_label,
             peer_url=base,
             reason="malformed_manifest",
@@ -327,8 +329,9 @@ def _record_peer_status(
         prev = _peer_status.get(peer_key)
         _peer_status[peer_key] = new_status
     if new_status == "reachable" and prev == "unreachable":
-        emit_sync_event(
+        emit_node_event(
             "peer_reachable",
+            category="health",
             peer_pubkey=peer_pubkey,
             peer_url=peer_url,
         )
@@ -510,8 +513,9 @@ def _tick(
                 # feed reflects a crashed iteration. The normal
                 # manifest-failure path emits inside
                 # `sync_with_peer` itself.
-                emit_sync_event(
+                emit_node_event(
                     "peer_unreachable",
+                    category="health",
                     peer_pubkey=pubkey or "",
                     peer_url=url,
                     reason="sync_with_peer_crashed",

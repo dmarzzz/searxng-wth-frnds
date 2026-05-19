@@ -35,6 +35,124 @@ _SERVICE_TYPE = "_indrex._tcp.local."
 logger = logging.getLogger(__name__)
 
 
+# ── node event ring (docs/SYNC.md §13) ────────────────────────────────
+#
+# `browse_mdns` is called periodically by callers like
+# `discover_all_peers` (each peer-scraper tick) and the sync loop's
+# default discover_fn. We piggyback on those existing invocations to
+# emit `mdns_peer_appeared` / `mdns_peer_disappeared` into the
+# unified node event log, with a per-pubkey re-announce dedupe so
+# mDNS's natural re-broadcast doesn't spam the renderer feed.
+#
+# State is module-level (per-process) and guarded by a lock — the
+# emit hot path on the zeroconf callback thread must not block the
+# main scraper.
+_mdns_seen_pubkeys: set[str] = set()
+_mdns_last_appear_ms: dict[str, int] = {}
+# instance_name → (pubkey, peer_name). Populated on appear so the
+# disappear callback (which only gets the instance name; the
+# zeroconf cache has already evicted the TXT record by then) can
+# resolve the right pubkey to fire `mdns_peer_disappeared` with.
+_mdns_instance_to_peer: dict[str, tuple[str, str]] = {}
+_mdns_state_lock = threading.Lock()
+# 60s dedupe window: mDNS service caches re-announce every ~25s on
+# many implementations; we want one appear event per real
+# online→offline→online transition, not one per re-broadcast.
+_MDNS_APPEAR_DEDUPE_MS = 60_000
+
+
+def _own_pubkey_for_mdns_filter() -> str:
+    """Resolve our own pubkey so the appear/disappear emitters don't
+    fire for self-loop mDNS broadcasts. Best-effort + cached on the
+    identity module's side; failure returns empty string (which won't
+    match any real pubkey)."""
+    try:
+        from swf.identity import get_or_create_identity
+        return (get_or_create_identity().pub_b64 or "")
+    except Exception:
+        return ""
+
+
+def _emit_mdns_appeared(
+    *,
+    instance_name: str,
+    peer_pubkey: str,
+    peer_name: str,
+    peer_url: str,
+    txt: dict,
+) -> None:
+    """Fire `mdns_peer_appeared` with the 60s dedupe gate.
+
+    Wrapped in try/except so a ring-buffer failure never breaks
+    discovery. Called under no locks held by the caller other than
+    the zeroconf listener's own internal lock.
+    """
+    now_ms = int(time.time() * 1000)
+    with _mdns_state_lock:
+        last = _mdns_last_appear_ms.get(peer_pubkey, 0)
+        # Always record the instance→peer mapping so the disappear
+        # callback can resolve the pubkey, even when the appear event
+        # itself is suppressed by the dedupe window.
+        _mdns_instance_to_peer[instance_name] = (peer_pubkey, peer_name)
+        if (now_ms - last) < _MDNS_APPEAR_DEDUPE_MS:
+            # Within the re-announce window; don't re-fire.
+            _mdns_seen_pubkeys.add(peer_pubkey)
+            return
+        _mdns_last_appear_ms[peer_pubkey] = now_ms
+        _mdns_seen_pubkeys.add(peer_pubkey)
+    try:
+        from swf.sync.event_log import emit_node_event
+        # Surface a short summary of the TXT record so the renderer
+        # can show what version / protocol the peer advertises
+        # without us shipping a dict-of-arbitrary-bytes.
+        txt_summary = " ".join(
+            f"{k}={v}"
+            for k, v in sorted((txt or {}).items())
+            if k in ("v", "proto", "node", "port")
+        )
+        emit_node_event(
+            "mdns_peer_appeared",
+            category="mdns",
+            peer_pubkey=peer_pubkey,
+            peer_name=peer_name,
+            peer_url=peer_url,
+            txt_record_summary=txt_summary,
+        )
+    except Exception:
+        # Event emission must never break discovery.
+        pass
+
+
+def _emit_mdns_disappeared(*, peer_pubkey: str, peer_name: str) -> None:
+    """Fire `mdns_peer_disappeared` and clear the appear-dedupe stamp.
+
+    Clearing the stamp means a re-announce after a real removal will
+    re-fire `mdns_peer_appeared` immediately rather than getting eaten
+    by the 60s window.
+    """
+    with _mdns_state_lock:
+        _mdns_seen_pubkeys.discard(peer_pubkey)
+        _mdns_last_appear_ms.pop(peer_pubkey, None)
+    try:
+        from swf.sync.event_log import emit_node_event
+        emit_node_event(
+            "mdns_peer_disappeared",
+            category="mdns",
+            peer_pubkey=peer_pubkey,
+            peer_name=peer_name,
+        )
+    except Exception:
+        pass
+
+
+def reset_mdns_dedupe_for_tests() -> None:
+    """Test-only: clear the per-pubkey appear-dedupe state."""
+    with _mdns_state_lock:
+        _mdns_seen_pubkeys.clear()
+        _mdns_last_appear_ms.clear()
+        _mdns_instance_to_peer.clear()
+
+
 def _log(msg: str) -> None:
     # #79: legacy verbose-gated info log. The logger level (DEBUG when
     # RA_VERBOSE / SWF_VERBOSE is set, INFO otherwise) handles the gate
@@ -402,6 +520,7 @@ def browse_mdns(timeout: float = 1.5) -> list[DiscoveredPeer]:
         return []
 
     hits: dict[str, DiscoveredPeer] = {}
+    own_pk = _own_pubkey_for_mdns_filter()
 
     class _Listener(ServiceListener):
         def add_service(self, zc, type_, name):  # noqa: D401,N802
@@ -422,20 +541,45 @@ def browse_mdns(timeout: float = 1.5) -> list[DiscoveredPeer]:
             # (dev/test, redundant operators) — both nodes share the
             # hostname, so a hostname filter eats the peer entirely.
             url = f"http://{addr}:{port}"
+            pubkey = txt.get("pk") or None
             hits[url] = DiscoveredPeer(
                 name=node,
                 url=url,
                 source="mdns",
-                pubkey=txt.get("pk") or None,
+                pubkey=pubkey,
                 meta={"protocol": txt.get("proto", ""), "version": txt.get("v", "")},
             )
             _log(f"mdns discovered {node} at {url}")
+            # Emit `mdns_peer_appeared` (subject to 60s dedupe). Skip
+            # our own broadcast — `own_pk` is the identity-resolved
+            # base64url pubkey; the TXT `pk` field carries the same
+            # form. Peers without a pubkey (legacy or misconfigured)
+            # also skip — there's no stable identifier to dedupe on.
+            if pubkey and pubkey != own_pk:
+                _emit_mdns_appeared(
+                    instance_name=name,
+                    peer_pubkey=pubkey,
+                    peer_name=node,
+                    peer_url=url,
+                    txt=txt,
+                )
 
         def update_service(self, zc, type_, name):
             self.add_service(zc, type_, name)
 
         def remove_service(self, zc, type_, name):
-            pass
+            # zeroconf invokes this when a TTL expires or the peer
+            # explicitly unregisters. The TXT record has already
+            # been evicted from the zeroconf cache, so we resolve
+            # the pubkey via the instance→peer map we populated on
+            # appear.
+            with _mdns_state_lock:
+                entry = _mdns_instance_to_peer.pop(name, None)
+            if entry is not None:
+                pubkey, peer_name = entry
+                _emit_mdns_disappeared(
+                    peer_pubkey=pubkey, peer_name=peer_name,
+                )
 
     try:
         zc = Zeroconf(ip_version=IPVersion.V4Only)

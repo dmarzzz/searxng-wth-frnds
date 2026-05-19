@@ -1527,6 +1527,174 @@ independent — neither blocks the other.
 
 ---
 
+## 13. Generalized node event log + `/node/log` endpoint
+
+> Added in v0.12.0. The SROS Network tab renders a single unified
+> stream of "what the daemon is doing right now" — mDNS discovery,
+> peer health, sync activity, bundle puller, web search.
+
+### 13.1 Motivation
+
+§12 covered the sync subsystem only. The renderer's Network tab grew
+to want one stream: mDNS appearance + disappearance, peer health
+edges, sync ticks, scraper pulls, bundle puller, and web-search
+activity. Maintaining one ring per subsystem would multiply the
+state and force the renderer to poll N endpoints.
+
+v0.12.0 generalizes the v0.11.3 sync ring to a node-wide ring:
+
+- The same `deque[dict]`, the same `_event_seq` counter, the same
+  lock. No new state, no new background timers.
+- Every event carries a `category` field so the renderer (or
+  endpoint) can slice the stream cheaply.
+- `/sync/log` keeps working — it's now an alias for
+  `/node/log?category=sync` (filtered server-side), so v0.11.3
+  clients see no behavior change.
+
+### 13.2 Event categories
+
+Every event in the ring carries `"category": "<name>"` alongside the
+existing `seq` / `kind` / `ts_ms` reserved fields:
+
+| Category   | Meaning                                                                                                | Example kinds                                                       |
+| ---------- | ------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------- |
+| `sync`     | Sync-loop wire activity (the v0.11.3 events; back-compat surface for `/sync/log`)                       | `tick`, `manifest_fetched`, `pulled`, `applied_local`               |
+| `mdns`     | LAN-local mDNS service browser observations                                                            | `mdns_peer_appeared`, `mdns_peer_disappeared`                       |
+| `health`   | Per-peer reachability transitions                                                                      | `peer_unreachable`, `peer_reachable`                                |
+| `ingest`   | Successful pulls of remote content (peer pages, bundles)                                               | `scraper_pulled`, `bundle_pulled`                                   |
+| `search`   | `/web_search` lifecycle                                                                                | `web_search_started`, `web_search_completed`                        |
+| `error`    | Pull/scrape/verify failures the renderer wants to surface as a fault state, distinct from `unreachable` | `scraper_error`                                                     |
+
+Notes:
+
+- `peer_unreachable` is `health`, not `error`: unreachable is a
+  reachability **state**, not a fault. The renderer renders the two
+  differently — a peer that's offline shows as muted; a peer that's
+  shipping malformed bundles shows as red.
+- The category is **not validated** at emit time (the hot path stays
+  cheap). New emit sites are expected to use the canonical names
+  enumerated in `swf.sync.event_log.NODE_EVENT_CATEGORIES`.
+- Events emitted before v0.12.0 lack `category`. The ring is
+  per-process, so a running daemon never holds a mix; the filter is
+  defensive on the read side.
+
+### 13.3 Event kinds (v0.12.0 additions)
+
+| Kind                    | Category | Where emitted                                                                                                       | Payload                                                                                  |
+| ----------------------- | -------- | ------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| `mdns_peer_appeared`    | `mdns`   | `discovery.browse_mdns` listener add-callback, on a non-self pubkey, gated by a 60s per-pubkey dedupe window         | `peer_pubkey`, `peer_name`, `peer_url`, `txt_record_summary`                              |
+| `mdns_peer_disappeared` | `mdns`   | `discovery.browse_mdns` listener remove-callback (zeroconf TTL expiry or explicit unregister)                       | `peer_pubkey`, `peer_name`                                                                |
+| `scraper_pulled`        | `ingest` | `peer_scraper.pull_from_peer` after a successful `ingest_bundle` that stored at least one new row                    | `peer_pubkey`, `peer_url`, `count`, `kind` (always `"pages"` for the indrex puller)       |
+| `scraper_error`         | `error`  | `peer_scraper.pull_from_peer` on liveness-probe / HTTP / verify failures                                            | `peer_pubkey`, `peer_url`, `error`                                                        |
+| `bundle_pulled`         | `ingest` | `bundles.puller.pull_from_peer` after a tick that ingested at least one new bundle                                  | `peer_pubkey`, `peer_url`, `bundle_count`, `bytes`                                        |
+| `web_search_started`    | `search` | `/web_search` handler, immediately before invoking the router                                                       | `query_hash` (truncated SHA-256 of the query), `started_at_ms`                            |
+| `web_search_completed`  | `search` | `/web_search` handler, after the router returns or raises                                                           | `query_hash`, `hit_count`, `duration_ms`, `source` (`"local"`, `"federated"`, `"error"`)  |
+
+The raw query string is **never** included in a `search` event — only
+the truncated hash. Queries can be sensitive; the ring is a renderer
+observability surface, not an audit log.
+
+The mDNS dedupe is per-pubkey, 60 seconds: zeroconf re-broadcasts a
+service every ~25s by default, and without the gate the appear feed
+would pulse on every re-announce. A `mdns_peer_disappeared` clears
+the dedupe stamp so a real reconnect re-fires `mdns_peer_appeared`
+immediately.
+
+### 13.4 `GET /node/log`
+
+```
+GET /node/log?since_seq=<int>&since_ms=<int>&limit=<int>&category=<csv>
+```
+
+No auth — same posture as `/sync/log` / `/sync/manifest`. Query
+parameters:
+
+| Parameter   | Type | Default | Notes                                                                                                              |
+| ----------- | ---- | ------- | ------------------------------------------------------------------------------------------------------------------ |
+| `since_seq` | int  | absent  | Return events with `seq > since_seq`. Primary cursor.                                                              |
+| `since_ms`  | int  | absent  | Return events with `ts_ms > since_ms`. Fallback. Ignored if `since_seq` is set.                                    |
+| `limit`     | int  | 200     | Max events in the response. Clamped to 500.                                                                        |
+| `category`  | csv  | absent  | Comma-separated list of categories to include (e.g. `sync,mdns`). Absent or empty → all categories.                |
+
+Response:
+
+```json
+{
+  "schema": "swf.node.log.v1",
+  "node_pubkey": "<own pubkey base64url>",
+  "tail_seq": 217,
+  "events": [
+    {"seq": 218, "kind": "mdns_peer_appeared", "category": "mdns",
+     "ts_ms": 1731974430000,
+     "peer_pubkey": "ed25519:...", "peer_name": "kettle",
+     "peer_url": "http://10.0.0.42:6651",
+     "txt_record_summary": "node=kettle port=6651 proto=searxng-wth-frnds/v0.3 v=0.12.0"},
+    ...
+  ]
+}
+```
+
+`tail_seq` is the highest `seq` currently in the ring (or 0 when
+empty). It's emitted independent of the filtered window so a
+category-filtered poll still advances the cursor.
+
+Bad input matches `/sync/log`'s behavior: negative or non-numeric
+`since_seq` / `since_ms` → 400; `limit=0` → 400; `limit > max`
+clamps to 500. Unknown category names are silently ignored on the
+filter (the response simply has nothing from them); we don't 400 on
+unknown values so a renderer polling a node from a future version
+can opt into a category before the node has anything to emit for it.
+
+### 13.5 Back-compat: `/sync/log`
+
+`/sync/log` is unchanged from §12 from a client's perspective:
+
+- Returns `{"schema": "swf.sync.log.v1", ...}` (not `swf.node.log.v1`).
+- Same cursor + limit semantics.
+- Filters events server-side to `category=sync`, so v0.11.3 clients
+  that don't expect mDNS or search events on this endpoint don't
+  start seeing them after the daemon upgrade.
+
+Internally `/sync/log` is `/node/log` with a fixed `categories =
+{"sync"}` filter; both routes share parsing via
+`_parse_event_log_qs`.
+
+### 13.6 Observability, not journaling
+
+The same "this is per-process, restarts wipe it" disclaimer from
+§12.6 applies to the node ring as a whole. Durable history for the
+sync substrate still lives in `sync_records` (§6); for the bundle
+substrate, in the `bundles` table; for the scraper, in the indrex
+DB itself. The ring is the renderer's live tail, not an audit
+mechanism.
+
+The existing per-subsystem `logger.info` lines (sync-loop `tick`,
+scraper `tick`, bundle puller `tick`) are unchanged. Every emit site
+in v0.12.0 wraps the ring emission in `try/except` so a ring failure
+never breaks the daemon's actual work.
+
+### 13.7 Test coverage
+
+`tests/sync/test_node_log.py` covers:
+
+- `?category=` filter narrows results to the requested slice.
+- Unknown category in `?category=` returns an empty events list
+  (filter behaves as a server-side intersection).
+- New event kinds (`mdns_peer_appeared`, `scraper_pulled`,
+  `web_search_started`, etc.) are emitted and queryable through
+  `/node/log`.
+- Back-compat: `/sync/log` without `?category=` still returns ONLY
+  `category=sync` events, even when other categories are present in
+  the ring.
+- `emit_sync_event` alias tags emitted events with
+  `category="sync"`.
+- `emit_node_event` accepts an explicit `category`.
+- Ring-buffer failures inside emit sites don't crash the daemon
+  (mDNS appear/disappear, scraper/bundle/web-search emits all wrap
+  `try/except`).
+
+---
+
 ## Appendix A: cross-references
 
 - `DESIGN.md` — `src/swf/` module map; sync code lives under

@@ -4,6 +4,59 @@ All notable changes to this project will be documented here. The
 format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.0] — 2026-05-19
+
+### Added
+- **`GET /node/log`** endpoint (`docs/SYNC.md` §13) — generalized
+  read-only window onto the in-process event ring, now spanning every
+  subsystem the daemon runs (sync, mDNS discovery, peer health,
+  scraper/bundle ingest, web search). Same cursor + limit contract as
+  `/sync/log`; adds an optional `?category=` CSV filter
+  (`sync`, `mdns`, `health`, `ingest`, `search`, `error`). Response
+  schema: `swf.node.log.v1`.
+- **`category` field on every event** — emitted alongside the
+  existing `seq` / `kind` / `ts_ms`. Reserved at emit time; callers
+  cannot overwrite it via payload. The canonical category set is
+  exposed as `swf.sync.event_log.NODE_EVENT_CATEGORIES`.
+- **New event kinds** (see §13.3):
+  - `mdns_peer_appeared` / `mdns_peer_disappeared` (category `mdns`)
+    — emitted from `discovery.browse_mdns`'s zeroconf listener, with
+    a 60s per-pubkey dedupe so re-broadcasts don't spam the feed.
+  - `scraper_pulled` / `scraper_error` (categories `ingest` / `error`)
+    — emitted from `peer_scraper.pull_from_peer` on successful page
+    ingest and on liveness / HTTP / verify failures.
+  - `bundle_pulled` (category `ingest`) — emitted from
+    `bundles.puller.pull_from_peer` after a tick that ingested at
+    least one new bundle, with `bundle_count` and approximate
+    `bytes`.
+  - `web_search_started` / `web_search_completed` (category
+    `search`) — emitted by the `/web_search` handler, gated on a
+    truncated SHA-256 `query_hash` (the raw query is never carried
+    on the ring).
+- **`emit_node_event(kind, *, category, payload=None, **kwargs)`** —
+  primary emitter. `payload=` is the collision-safe channel for
+  payloads whose field names overlap with the function signature
+  (e.g. the `scraper_pulled` event's `kind: "pages"|"bundles"`).
+- **`tests/sync/test_node_log.py`** — category-filter narrowing,
+  back-compat `/sync/log` still returns only `sync`, mDNS dedupe
+  window, ring-failure swallow at every emit site, HTTP
+  integration over `/node/log`.
+
+### Changed
+- `peer_unreachable` / `peer_reachable` are now tagged with
+  `category="health"` (previously implicitly `sync`). The renderer
+  distinguishes reachability state from sync wire activity.
+- `GET /sync/log` is now a back-compat alias that filters
+  server-side to `category=sync`. Response schema stays
+  `swf.sync.log.v1`; v0.11.3 clients see no behavior change.
+
+### Deprecated
+- `swf.sync.event_log.emit_sync_event(kind, **payload)` — kept as a
+  deprecated alias that auto-fills `category="sync"`. New code
+  should call `emit_node_event` directly.
+- `swf.sync.event_log.get_sync_events(...)` — kept as a deprecated
+  alias for `get_node_events(..., categories={"sync"})`.
+
 ## [0.11.3] — 2026-05-19
 
 ### Added
