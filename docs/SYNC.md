@@ -1340,6 +1340,193 @@ graduates back to the cohort-keys gate.
 
 ---
 
+## 12. Sync event ring buffer + `/sync/log` endpoint
+
+> Added in v0.11.3. Powers the SROS renderer's live "network activity"
+> feed + per-peer heartbeat pulses.
+
+### 12.1 Motivation
+
+The sync subsystem is a quiet background loop. Operators see one
+`logger.info("tick visited=N pulled=K applied=M")` line every 30s on
+stderr and nothing else. That's adequate for ops but useless for a
+renderer trying to draw a pulse-on-activity visualization.
+
+§12 adds a tiny in-process ring buffer of recent sync events surfaced
+over a read-only HTTP endpoint. The renderer polls it on a short
+interval (a few seconds) and uses the event stream to drive its
+graphical state — per-peer heartbeat pulses, a scrolling activity
+feed, a `pulled` flash when an envelope lands.
+
+### 12.2 The ring buffer
+
+Module: `swf.sync.event_log`. Module-level state:
+
+```python
+_RING_MAXLEN = 200
+_event_ring: deque[dict] = deque(maxlen=_RING_MAXLEN)
+_event_lock = threading.Lock()
+_event_seq = 0  # monotonic counter
+```
+
+Design constraints:
+
+- **Per-process.** The ring is in-memory only. Restarts wipe it. This
+  is intentional — durable history of the sync substrate lives in
+  `sync_records` (§6), and §7's `/sync/record/<id>/history` route
+  serves it. The ring is a renderer-tail for live activity, not a
+  journal.
+- **Bounded.** `maxlen=200` keeps memory trivial (~200 small dicts).
+  On a busy node the oldest events fall off; the renderer is expected
+  to poll fast enough to never lose state.
+- **Lock-minimal.** The emit path is on the sync hot loop. The
+  critical section is: bump `_event_seq`, build dict, append. No
+  JSON encoding, no I/O, no logging. `get_sync_events` snapshots the
+  deque under the lock then filters outside.
+- **Monotonic seq.** Events carry a hand-rolled `seq` int that
+  increments on every emit. The renderer uses `seq` as its cursor;
+  `ts_ms` is informational and collision-prone, `seq` is total.
+
+### 12.3 Event shape
+
+All events are flat JSON dicts with three reserved fields plus
+kind-specific payload:
+
+```json
+{
+  "seq": 17,
+  "kind": "pulled",
+  "ts_ms": 1731974400123,
+  "peer_pubkey": "ed25519:abc…",
+  "peer_url": "http://10.0.0.42:6651",
+  "record_id": "amiller",
+  "wall_ts_ms": 1731974398555,
+  "content_hash": "sha256:…"
+}
+```
+
+Caller payload keys that collide with `seq` / `kind` / `ts_ms` are
+silently dropped — the ring's reserved fields are the source of
+truth.
+
+### 12.4 Event kinds
+
+| Kind                  | Where emitted                                           | Payload                                                                                       |
+| --------------------- | ------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| `tick`                | End of every `sync_loop._tick()` iteration              | `visited`, `pulled`, `applied`, `duration_ms`                                                 |
+| `manifest_fetched`    | Per peer in `sync_with_peer` on a successful manifest fetch | `peer_pubkey`, `peer_url`, `record_count`                                                  |
+| `peer_unreachable`    | Per peer when the manifest fetch fails (network error, non-2xx, malformed response, or a crashing `sync_with_peer`) | `peer_pubkey`, `peer_url`, `reason`               |
+| `peer_reachable`      | On the FIRST successful manifest fetch after a prior `peer_unreachable` for the same pubkey (transition edge) | `peer_pubkey`, `peer_url`                       |
+| `pulled`              | Per envelope where `apply_envelope(...).was_new=True` from a remote pull | `peer_pubkey`, `peer_url`, `record_id`, `wall_ts_ms`, `content_hash`        |
+| `applied_local`       | On `POST /sync/local_record` returning 201              | `record_id`, `wall_ts_ms`, `content_hash`                                                     |
+
+Notes:
+
+- `tick` fires every loop iteration **even when nothing changed** —
+  that's the renderer's heartbeat for the subsystem itself.
+- `manifest_fetched` carries `record_count` so the renderer can size
+  a per-peer pulse by traffic load without us emitting one event per
+  remote record_id.
+- `pulled` is emitted only for `was_new=True` apply results. Replays
+  (`was_new=False`) would spam the feed.
+- `peer_reachable` is an **edge** event — it fires only on the
+  `unreachable → reachable` transition. The very first contact with a
+  peer never emits `peer_reachable`; the natural `manifest_fetched`
+  event suffices as a positive heartbeat.
+
+### 12.5 `GET /sync/log`
+
+```
+GET /sync/log?since_seq=<int>&since_ms=<int>&limit=<int>
+```
+
+No auth — same posture as `/sync/manifest`. The ring is per-process
+and the event payloads describe sync activity that is already
+inferable from `/sync/manifest`, so there's no incremental disclosure.
+
+Query parameters:
+
+| Parameter   | Type | Default | Notes                                                            |
+| ----------- | ---- | ------- | ---------------------------------------------------------------- |
+| `since_seq` | int  | absent  | Return events with `seq > since_seq`. Primary cursor.            |
+| `since_ms`  | int  | absent  | Return events with `ts_ms > since_ms`. Fallback. Ignored if `since_seq` is set. |
+| `limit`     | int  | 200     | Max events in the response. Clamped to 500.                      |
+
+Bad input (`since_seq=-1`, `since_seq=abc`, `limit=0`) returns 400
+with a structured `{"error": "invalid_<field>"}` body. `limit` >
+max clamps silently to 500.
+
+Response:
+
+```json
+{
+  "schema": "swf.sync.log.v1",
+  "node_pubkey": "<own pubkey base64url>",
+  "tail_seq": 217,
+  "events": [
+    {"seq": 218, "kind": "tick", "ts_ms": 1731974430000,
+     "visited": 1, "pulled": 0, "applied": 0, "duration_ms": 23},
+    ...
+  ]
+}
+```
+
+`tail_seq` is the highest `seq` currently in the ring (or 0 when
+empty). It's a separate field — not just `events[-1].seq` — so a
+client polling with `since_seq=tail_seq` gets an empty `events` list
+on a quiet node and still knows where to resume on the next poll.
+This means the renderer's poll loop is:
+
+```text
+cursor = 0
+while running:
+    body = GET /sync/log?since_seq=cursor
+    render(body.events)
+    cursor = body.tail_seq
+    sleep(poll_interval)
+```
+
+### 12.6 Persistence + ops
+
+The ring is **not durable**. Restarting `swf-node` clears the buffer
+and resets `_event_seq` to 0. This is by design:
+
+- The renderer is a debug surface, not a system-of-record. Lost
+  events on a restart are acceptable.
+- Persisting would require a separate sqlite table, schema migrations,
+  and a vacuum policy — none of which buys anything for the live-feed
+  use case.
+- The durable view of "what was synced" is `sync_records` itself,
+  queryable via `/sync/manifest` and `/sync/record/<id>/history`.
+
+The existing `[sync-loop] tick visited=N pulled=K applied=M` stderr
+log line is **unchanged**. Both pathways are useful: stderr for ops
+tailing journalctl, ring for the renderer. The two emit sites are
+independent — neither blocks the other.
+
+### 12.7 Test coverage
+
+`tests/sync/test_event_log.py` covers:
+
+- Ring wraps at `_RING_MAXLEN`; the oldest events are dropped.
+- `since_seq` returns strictly newer events; `since_seq=0` returns
+  everything; `since_seq=tail` returns empty.
+- `since_ms` returns events strictly after the threshold.
+- `since_seq` takes precedence when both cursors are passed.
+- `limit` caps the response slice (newest tail); `limit=0` empty;
+  large `limit` no-op.
+- Caller payload cannot overwrite reserved fields.
+- Thread-safety smoke test: 4 emitter threads × 100 emits + 1
+  reader, no exceptions, seq monotonic and unique.
+- HTTP integration: spin a real `peer_server`, `POST /sync/local_record`,
+  `GET /sync/log`, assert the `applied_local` event surfaces with
+  the right `record_id` + `content_hash`. `since_seq=tail_seq` returns
+  an empty events list.
+- HTTP input validation: negative / non-numeric cursors → 400;
+  `limit=0` → 400; `limit=99999` clamps silently.
+
+---
+
 ## Appendix A: cross-references
 
 - `DESIGN.md` — `src/swf/` module map; sync code lives under
