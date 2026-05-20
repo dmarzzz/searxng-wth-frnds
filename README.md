@@ -19,11 +19,12 @@ swf-node-<version>-mac-arm64
 swf-node-<version>-mac-x64
 swf-node-<version>-linux-x64
 swf-node-<version>-linux-arm64
+swf-node-<version>-windows-x64.exe
 ```
 
-`<version>` is the git tag minus the leading `v` (e.g. tag `v0.8.0` → asset suffix `0.8.0`). Windows binaries are not produced today; it's tracked as a feature request.
+`<version>` is the git tag minus the leading `v` (e.g. tag `v0.8.0` → asset suffix `0.8.0`). The Windows asset is the only one with a file extension — embedders that resolve by `(os, arch)` should append `.exe` when `os == "windows"`. Windows arm64 isn't produced today (no `pyrage` arm64-windows wheel upstream); track via the feature-request issue if you need it.
 
-These binaries are intended for **embedding**: hosts like the [Shape Rotator OS](https://shaperotator.xyz) Electron app fetch the matching `(os, arch)` asset for each release and spawn it as a sidecar daemon. The binary is self-contained, runnable from an arbitrary working directory (state lives under `~/.local/share/swf/` regardless of where you start it from), and accepts the same `--bind` / `--port` / `--no-mdns` flags (and `SWF_BIND` / `SWF_PORT` / `SWF_NO_MDNS` env vars) as a pip-installed `swf-node`.
+These binaries are intended for **embedding**: hosts like the [Shape Rotator OS](https://shaperotator.xyz) Electron app fetch the matching `(os, arch)` asset for each release and spawn it as a sidecar daemon. The binary is self-contained, runnable from an arbitrary working directory (state lives under `~/.local/share/swf/` on POSIX, and under `%USERPROFILE%\.local\share\swf\` on Windows by default — embedders that prefer the idiomatic Windows location should set `SWF_STATE_DIR` to e.g. `%LOCALAPPDATA%\swf`), and accepts the same `--bind` / `--port` / `--no-mdns` flags (and `SWF_BIND` / `SWF_PORT` / `SWF_NO_MDNS` env vars) as a pip-installed `swf-node`.
 
 There are two embedding shapes — pick the one that matches what the host app is trying to do:
 

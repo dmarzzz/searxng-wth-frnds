@@ -48,14 +48,17 @@ jobs:
             runner: macos-14
             os: mac
             arch: arm64
+            ext: ""
           - label: mac-x64
             runner: macos-13
             os: mac
             arch: x64
+            ext: ""
           - label: linux-x64
             runner: ubuntu-24.04
             os: linux
             arch: x64
+            ext: ""
           # GitHub-hosted arm64 Linux runner. If your org doesn't have
           # access, swap this for `ubuntu-22.04` and add a `docker run
           # --platform linux/arm64` cross-build — see TODO in this file.
@@ -63,6 +66,18 @@ jobs:
             runner: ubuntu-24.04-arm
             os: linux
             arch: arm64
+            ext: ""
+          # Windows x64. We don't ship a windows-arm64 leg because
+          # `pyrage` doesn't publish an arm64-windows wheel today (only
+          # win_amd64). If/when upstream lands one, mirror the linux-arm64
+          # row here. All steps below run under Git Bash (`shell: bash`,
+          # the default on windows-latest runners), so the heredocs and
+          # `&` / `kill` plumbing in the smoke tests work identically.
+          - label: windows-x64
+            runner: windows-latest
+            os: windows
+            arch: x64
+            ext: .exe
     env:
       # Force loopback so any zeroconf register attempt during a smoke
       # spawn doesn't hang on a runner with no LAN.
@@ -167,8 +182,12 @@ jobs:
           # route registry + §29.2 invariants). It exits 0 on all-pass.
           # If PyInstaller missed a hidden import, this is where it
           # surfaces — usually as ModuleNotFoundError before any output.
-          binary="dist/${{ steps.ver.outputs.asset }}"
-          chmod +x "$binary"
+          #
+          # PyInstaller auto-appends `.exe` on Windows; matrix.ext carries
+          # the suffix ("" on POSIX, ".exe" on Windows) so the same path
+          # resolves on every leg.
+          binary="dist/${{ steps.ver.outputs.asset }}${{ matrix.ext }}"
+          chmod +x "$binary" || true  # no-op on Windows; harmless on POSIX
           # Run from /tmp so we exercise the "spawned from a different
           # cwd than the binary" path (Electron will do exactly that).
           (cd "$(mktemp -d)" && "$GITHUB_WORKSPACE/$binary" --check)
@@ -176,7 +195,7 @@ jobs:
       - name: Smoke test — spawn + curl /health
         shell: bash
         run: |
-          binary="$GITHUB_WORKSPACE/dist/${{ steps.ver.outputs.asset }}"
+          binary="$GITHUB_WORKSPACE/dist/${{ steps.ver.outputs.asset }}${{ matrix.ext }}"
           # Use a non-default port so we don't collide with anything
           # else on the runner, and so the test is reproducible.
           port=17777
@@ -217,8 +236,11 @@ jobs:
       - name: Upload workflow artifact (always)
         uses: actions/upload-artifact@v7
         with:
+          # Artifact name stays suffix-free; the file *inside* the artifact
+          # keeps its .exe extension on Windows so consumers can run it as
+          # downloaded without renaming.
           name: ${{ steps.ver.outputs.asset }}
-          path: dist/${{ steps.ver.outputs.asset }}
+          path: dist/${{ steps.ver.outputs.asset }}${{ matrix.ext }}
           if-no-files-found: error
           retention-days: 14
 
@@ -226,7 +248,7 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v3
         with:
-          files: dist/${{ steps.ver.outputs.asset }}
+          files: dist/${{ steps.ver.outputs.asset }}${{ matrix.ext }}
           fail_on_unmatched_files: true
           # Don't clobber whatever the release maintainer wrote; just
           # append assets.
