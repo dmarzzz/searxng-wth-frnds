@@ -1423,13 +1423,20 @@ def pull_from_peer(
     # parameter, so we route the payload through `payload=` — see
     # event_log.emit_node_event docstring.
     if stored > 0:
+        # Use `kind_pulled` not `kind` — the latter is a reserved field
+        # in emit_node_event (the OUTER `kind` is the event-type name,
+        # e.g. "scraper_pulled" itself). Payload `kind` was silently
+        # dropped, so the SROS renderer's "scraper · N <kind_pulled>"
+        # row was falling back to the literal "records" instead of
+        # showing "pages". Same goes for any future kinds (e.g.
+        # "bundles") emitted from this site.
         _emit_node(
             "scraper_pulled", category="ingest",
             payload={
                 "peer_pubkey": peer.pubkey,
                 "peer_url": base,
                 "count": stored,
-                "kind": "pages",
+                "kind_pulled": "pages",
             },
         )
     return (stored, "ok")

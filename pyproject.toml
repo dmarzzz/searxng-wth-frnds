@@ -1,6 +1,6 @@
 [project]
 name = "swf-node"
-version = "0.12.1"
+version = "0.12.2"
 description = "swf-node — self-sovereign LAN-first peer search. A Python daemon that maintains a local FTS5 indrex of pages you fetch and shares signed bundles with mDNS-discovered LAN peers."
 readme = "README.md"
 requires-python = ">=3.10"
