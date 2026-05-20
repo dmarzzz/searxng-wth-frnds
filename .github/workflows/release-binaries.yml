@@ -27,6 +27,19 @@ jobs:
   build:
     name: build (${{ matrix.label }})
     runs-on: ${{ matrix.runner }}
+    # 35-min wall clock per matrix leg. The build itself runs in ~5 min;
+    # the rest is the buffer for the runner queue. macos-13 (mac-x64)
+    # has been chronically queued for 14h+ on GH's free tier all this
+    # week — without this timeout the whole release-binaries workflow
+    # status sticks at "queued" for hours, blocking ops dashboards
+    # without actually blocking the binaries that DO ship (mac-arm64,
+    # linux-x64, linux-arm64 land in their own legs in parallel). With
+    # `fail-fast: false` already set, a mac-x64 timeout cancels JUST
+    # that leg; the others keep going and the release-binaries workflow
+    # completes (with a partial asset set) in a bounded time. Intel-mac
+    # cohort users get the dmg's stub fallback for that window; the
+    # next release can attempt mac-x64 again.
+    timeout-minutes: 35
     strategy:
       fail-fast: false
       matrix:
