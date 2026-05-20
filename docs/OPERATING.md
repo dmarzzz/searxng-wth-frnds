@@ -97,7 +97,16 @@ daemon checks the bearer in constant time when bind is non-loopback.
   iptables -A INPUT  -p udp --dport 5353 -j ACCEPT
   iptables -A OUTPUT -p udp --dport 5353 -j ACCEPT
   ```
-  macOS allows mDNS by default; no action needed.
+  macOS allows mDNS by default; no action needed. On **Windows**, the
+  first time swf-node binds with a non-loopback bind (LAN-peer shape),
+  Windows Defender Firewall will prompt for an inbound rule on the
+  swf-node binary — pick **Allow** for *Private* networks (the home/work
+  LAN profile); declining or allowing only *Public* leaves the daemon
+  reachable to nobody. Embedding hosts (e.g. the Shape Rotator OS
+  Electron app) that want to skip the prompt can pre-create the rule
+  via `New-NetFirewallRule` (TCP `SWF_PORT` + UDP 5353, profile
+  `Private`); see the Windows-specific firewall snippet in
+  [`docs/TROUBLESHOOTING.md`](TROUBLESHOOTING.md#windows-firewall).
 - Optional: outbound HTTP to `SEARXNG_URL`, outbound DNS, outbound
   HTTPS to whatever URLs `/fetch_url` is called on.
 

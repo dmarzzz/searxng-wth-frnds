@@ -196,3 +196,79 @@ bash scripts/reset-state.sh
 Prompts before each removal. Removes identity, search caches,
 reputation, tickets, and the entire `world_knowledge/` archive.
 After this, `swf-node init` to bootstrap fresh.
+
+## Windows
+
+swf-node ships a single-file `.exe` for Windows x64 starting with the
+release that includes this section. The runtime works the same as on
+macOS / Linux; the gotchas all sit around firewall, mDNS, and state
+directory layout.
+
+### Windows firewall
+
+The first time the daemon binds with a non-loopback bind, **Windows
+Defender Firewall** intercepts the listen and pops the standard
+"Allow `swf-node-...-windows-x64.exe` to communicate on these
+networks" prompt. Pick **Private** (the LAN profile). Allowing only
+**Public** keeps the binary firewall-blocked on every normal LAN.
+
+To pre-create the rule (so an embedding host like an Electron app
+can suppress the prompt), elevate PowerShell and run:
+
+```powershell
+$exe = "C:\Path\To\swf-node-<version>-windows-x64.exe"
+New-NetFirewallRule -DisplayName "swf-node TCP 7777" `
+    -Direction Inbound -Program $exe -Protocol TCP -LocalPort 7777 `
+    -Profile Private -Action Allow
+New-NetFirewallRule -DisplayName "swf-node mDNS 5353" `
+    -Direction Inbound -Program $exe -Protocol UDP -LocalPort 5353 `
+    -Profile Private -Action Allow
+```
+
+If `SWF_PORT` is set to something other than `7777`, substitute it
+in the TCP rule. The UDP 5353 rule is only needed in the LAN-peer
+shape (mDNS on); loopback-only embeds can skip it.
+
+### "no peers discovered" on Windows
+
+In addition to the [generic mDNS checklist](#no-peers-discovered):
+
+- **The firewall prompt was declined.** Check
+  `Get-NetFirewallRule -DisplayName 'swf-node*'`. If nothing comes
+  back, recreate the rules per the snippet above (or delete the
+  blocking entry under *Inbound rules* in `wf.msc` and let the
+  daemon re-prompt on next launch).
+- **Windows binds to the wrong interface.** When the host has
+  multiple active NICs (Wi-Fi + Ethernet + VPN), `zeroconf` registers
+  on whichever one `socket.gethostname()` resolves to first, which
+  may not be the LAN you expect. Pin the bind explicitly:
+  `swf-node --bind <your-LAN-IPv4>`. `ipconfig` lists the candidates.
+- **IPv6 link-local quirks.** swf-node hard-codes `IPVersion.V4Only`
+  for mDNS, so swf↔swf works without IPv6. If you also rely on
+  `dns-sd`/`Bonjour Browser` to verify the service shows up,
+  install Bonjour Print Services (ships `dns-sd.exe`); the
+  built-in Windows mDNS resolver does *not* enumerate `_indrex._tcp`.
+
+### State directory on Windows
+
+By default `Path.home()` resolves to `%USERPROFILE%` (e.g.
+`C:\Users\you`), so the config and state dirs land at:
+
+- `C:\Users\you\.config\swf\`
+- `C:\Users\you\.local\share\swf\`
+
+Embedders that prefer the idiomatic Windows location (under
+`%LOCALAPPDATA%`) should set `SWF_CONFIG_DIR` and `SWF_STATE_DIR`
+on the spawned subprocess, e.g. `SWF_STATE_DIR=%LOCALAPPDATA%\swf`.
+The mode-0700 chmod that swf-node attempts on these directories is a
+best-effort no-op on NTFS — the ACL inherited from the parent
+already restricts to the owning user, and the failed chmod is
+swallowed by `paths.ensure_dir`.
+
+### Where the daemon prints logs
+
+PyInstaller --onefile bundles use a temp extraction dir on each
+launch (`%LOCALAPPDATA%\Temp\_MEIxxxx`); the daemon's own logs go to
+stderr, not into that dir. If you spawn the binary as a sidecar from
+another process, capture stderr; if you run it interactively, run
+from a PowerShell window so the output stays visible.

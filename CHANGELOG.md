@@ -4,6 +4,38 @@ All notable changes to this project will be documented here. The
 format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.0] — 2026-05-20
+
+### Added
+- **Windows x64 PyInstaller binary** in the release matrix
+  (`.github/workflows/release-binaries.yml`). Asset name follows the
+  existing `(os, arch)` convention and is the only asset that carries a
+  file extension: `swf-node-<version>-windows-x64.exe`. Embedding hosts
+  (e.g. the Shape Rotator OS Electron app) that resolve releases by
+  `(os, arch)` should append `.exe` when `os == "windows"`. We don't
+  ship `windows-arm64` today — `pyrage` doesn't publish an arm64-windows
+  wheel; the row in the matrix is wired so it can be added the moment
+  upstream lands one. Closes #7; unblocks dmarzzz/shape-rotator-os#84.
+- **Windows classifier** in `pyproject.toml`
+  (`Operating System :: Microsoft :: Windows`) — runtime is verified by
+  the new release-matrix smoke tests (PyInstaller `--check` + spawn +
+  `/health`), which exercise the `import` graph for `zeroconf`,
+  `cryptography`, `pyrage`, `pynacl`, `psutil` on `windows-latest`.
+- **`docs/TROUBLESHOOTING.md` Windows section** covering the Defender
+  Firewall prompt, multi-NIC interface pinning, `IPVersion.V4Only` /
+  IPv6 link-local quirks, state-directory layout (`%USERPROFILE%`
+  defaults + `%LOCALAPPDATA%` opt-in via `SWF_STATE_DIR`), and where
+  PyInstaller `--onefile` logs land.
+- **`docs/OPERATING.md` Windows firewall paragraph** with a
+  `New-NetFirewallRule` snippet embedders can pre-create to suppress
+  the first-bind Defender prompt.
+
+### Changed
+- The PyInstaller workflow's binary path now resolves through a
+  `matrix.ext` field (`""` on POSIX, `.exe` on Windows) so the same
+  step works on every leg. The `chmod +x` on the binary is now
+  `|| true` — no-op on NTFS, harmless on POSIX.
+
 ## [0.12.0] — 2026-05-19
 
 ### Added
