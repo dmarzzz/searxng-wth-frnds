@@ -219,11 +219,13 @@ def test_results_are_fetched_and_indexed_into_pages(monkeypatch):
     # the foreground so the test deterministically observes index_page
     # calls (no timing-flake from waiting on the daemon thread).
     # Run the would-be-async indexer inline so the test deterministically
-    # observes index_page calls without waiting on a daemon thread.
+    # observes index_page calls without waiting on the pool.
     monkeypatch.setattr(
         public_egress,
         "_spawn_indexer",
-        public_egress._index_results_async,
+        lambda urls, titles: [
+            public_egress._index_one(u, t) for u, t in zip(urls, titles)
+        ],
     )
 
     out = search(_ctx())
@@ -260,11 +262,13 @@ def test_thin_results_are_not_indexed(monkeypatch):
     monkeypatch.setattr("swf.web.index.index_page",
                         lambda **kw: calls.append(kw))
     # Run the would-be-async indexer inline so the test deterministically
-    # observes index_page calls without waiting on a daemon thread.
+    # observes index_page calls without waiting on the pool.
     monkeypatch.setattr(
         public_egress,
         "_spawn_indexer",
-        public_egress._index_results_async,
+        lambda urls, titles: [
+            public_egress._index_one(u, t) for u, t in zip(urls, titles)
+        ],
     )
     search(_ctx())
     assert calls == []
@@ -281,12 +285,47 @@ def test_indexing_failures_dont_break_search(monkeypatch):
         raise RuntimeError("extractor on fire")
     monkeypatch.setattr("swf.web.fetch._get_clean_text", _raise)
     # Run the would-be-async indexer inline so the test deterministically
-    # observes index_page calls without waiting on a daemon thread.
+    # observes index_page calls without waiting on the pool.
     monkeypatch.setattr(
         public_egress,
         "_spawn_indexer",
-        public_egress._index_results_async,
+        lambda urls, titles: [
+            public_egress._index_one(u, t) for u, t in zip(urls, titles)
+        ],
     )
     out = search(_ctx())
     assert out.attempt.status == "ok"
     assert len(out.results) == 1
+
+
+def test_index_page_failures_dont_break_search(monkeypatch):
+    # If index_page itself raises (DB lock, disk full, bad row), the
+    # search response still succeeds and the other URLs still get a
+    # crack at being indexed — proves _index_one's per-URL try/except
+    # contains the failure rather than aborting the whole batch.
+    rows = [
+        {"url": "https://a.example/", "title": "A", "content": "s",
+         "score": 0.5, "engines": ["duckduckgo"]},
+        {"url": "https://b.example/", "title": "B", "content": "s",
+         "score": 0.5, "engines": ["duckduckgo"]},
+    ]
+    monkeypatch.setattr(public_egress.urllib.request, "urlopen",
+                        lambda req, timeout=None: _FakeResp(_make_searxng_payload(rows)))
+    monkeypatch.setattr("swf.web.fetch._get_clean_text",
+                        lambda url: ("x" * 500, "", "test-extractor"))
+    seen: list[str] = []
+    def _raises(**kwargs):
+        seen.append(kwargs["url"])
+        raise RuntimeError("db on fire")
+    monkeypatch.setattr("swf.web.index.index_page", _raises)
+    monkeypatch.setattr(
+        public_egress,
+        "_spawn_indexer",
+        lambda urls, titles: [
+            public_egress._index_one(u, t) for u, t in zip(urls, titles)
+        ],
+    )
+    out = search(_ctx())
+    assert out.attempt.status == "ok"
+    assert len(out.results) == 2
+    assert seen == ["https://a.example/", "https://b.example/"]

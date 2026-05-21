@@ -170,56 +170,67 @@ DEFAULT_TIMEOUT_SECONDS = 5.0
 MAX_SEARXNG_BYTES = 2 * 1024 * 1024
 
 
-def _index_results_async(urls: list[str], titles: list[str]) -> None:
-    """Fetch + index search-result URLs into the local `pages` corpus.
+# Bounded module-level pool for search-result indexing. Lazy-init so
+# tests / non-search code paths don't pay for it. A singleton pool
+# caps thread fan-out regardless of search rate — N concurrent searches
+# with top_k results each enqueue N*top_k tasks, but at most
+# `max_workers` ever run simultaneously. The pool's worker threads are
+# non-daemon; ThreadPoolExecutor's atexit hook joins them on process
+# shutdown.
+_INDEXER_POOL: ThreadPoolExecutor | None = None
+_INDEXER_POOL_LOCK = threading.Lock()
 
-    Called in a daemon thread from `search()` so the search response
-    isn't blocked on per-URL extraction. Each URL goes through the
-    existing fetch pipeline (`_get_clean_text`: 7-day disk cache →
-    trafilatura local extraction → Jina Reader fallback) and the
-    cleaned text is handed to `index_page()`, which writes the row +
-    `pages_meta` attribution + `page_cids` so peers' bundle pullers
-    can ship it onward. Without this step, public-egress searches
-    populated only the `search_results` FTS cache — atlas (which plots
-    `pages`) stayed empty and nothing reached the cohort.
 
-    Best-effort: every failure mode (network, extractor, index) is
-    swallowed silently per the same contract as the existing
-    `record_search_results` call.
+def _indexer_pool() -> ThreadPoolExecutor:
+    global _INDEXER_POOL
+    if _INDEXER_POOL is not None:
+        return _INDEXER_POOL
+    with _INDEXER_POOL_LOCK:
+        if _INDEXER_POOL is None:
+            _INDEXER_POOL = ThreadPoolExecutor(
+                max_workers=4,
+                thread_name_prefix="swf-search-indexer",
+            )
+        return _INDEXER_POOL
+
+
+def _index_one(url: str, search_title: str) -> None:
+    """Fetch + index a single search-result URL.
+
+    Runs on a worker in the bounded indexer pool. Walks the URL
+    through the existing fetch pipeline (`_get_clean_text`: 7-day
+    disk cache → trafilatura → Jina Reader) and feeds `index_page()`,
+    which writes the row + `pages_meta` attribution + `page_cids` so
+    peers' bundle pullers can ship it onward.
+
+    Best-effort: every failure mode (network, extractor, junk-title,
+    DB write) is swallowed silently per the same contract as the
+    `record_search_results` side-effect alongside this code path.
     """
     from swf.web.fetch import _get_clean_text
     from swf.web.index import index_page
-
-    def _one(url: str, search_title: str) -> None:
-        try:
-            text, extracted_title, _extractor = _get_clean_text(url)
-        except Exception:
-            return
-        if not text or len(text.strip()) < 100:
-            return
-        title = (search_title or extracted_title or "").strip()
-        fetched_at = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
-        try:
-            index_page(url=url, title=title, content=text, fetched_at=fetched_at)
-        except Exception:
-            return
-
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        for url, title in zip(urls, titles):
-            pool.submit(_one, url, title)
+    try:
+        text, extracted_title, _extractor = _get_clean_text(url)
+    except Exception:
+        return
+    if not text or len(text.strip()) < 100:
+        return
+    title = (search_title or extracted_title or "").strip()
+    fetched_at = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+    try:
+        index_page(url=url, title=title, content=text, fetched_at=fetched_at)
+    except Exception:
+        return
 
 
 def _spawn_indexer(urls: list[str], titles: list[str]) -> None:
-    """Fire-and-forget wrapper around `_index_results_async`. Lives as
-    a module-level function so tests can override it to run inline,
-    without monkeypatching `threading.Thread` (which would also break
-    the inner `ThreadPoolExecutor`).
+    """Submit each (url, title) into the bounded indexer pool. Returns
+    immediately. Test seam — tests monkeypatch this to run inline
+    instead of going through the pool.
     """
-    threading.Thread(
-        target=_index_results_async,
-        args=(urls, titles),
-        daemon=True,
-    ).start()
+    pool = _indexer_pool()
+    for url, title in zip(urls, titles):
+        pool.submit(_index_one, url, title)
 
 
 def search(
@@ -434,19 +445,16 @@ def search(
         # `search_results` cache. Atlas plots `pages` (and the bundle
         # layer ships `pages` to peers), so without an index_page()
         # call here, public-egress searches never produce towns and
-        # never reach the cohort. Fire-and-forget so the search
-        # response returns immediately; the daemon thread fetches
-        # each result through the existing extraction pipeline and
-        # feeds index_page() — which handles canonicalization,
-        # junk-title filtering, content-CID, and share-scope
-        # attribution.
-        try:
-            _spawn_indexer(
-                [r.canonical_url for r in out],
-                [r.title for r in out],
-            )
-        except Exception:
-            pass
+        # never reach the cohort. Submit each URL to the bounded
+        # module-level indexer pool — the search response returns
+        # immediately while pool workers fetch each result through
+        # the existing extraction pipeline and feed index_page(),
+        # which handles canonicalization, junk-title filtering,
+        # content-CID, and share-scope attribution.
+        _spawn_indexer(
+            [r.canonical_url for r in out],
+            [r.title for r in out],
+        )
 
     return RouteOutcome(
         results=out,
