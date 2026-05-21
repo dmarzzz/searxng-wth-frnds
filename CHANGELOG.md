@@ -4,6 +4,28 @@ All notable changes to this project will be documented here. The
 format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.1] — 2026-05-21
+
+### Fixed
+- **Public-egress search results now land in `pages`, not just the
+  FTS `search_results` cache.** `search()` previously called
+  `record_search_results()` to populate the result-list cache but
+  never invoked `index_page()` — so `/graph` (and therefore atlas /
+  cartography / cosmos in any embedding renderer) stayed blank on
+  every install whose only ingestion source was user search. The
+  peer-bundle layer reads from `pages` too, so cohort peers received
+  nothing from their friends' searches. Lifetime `page_added` event
+  counts stayed near zero across multi-week installs that ran
+  hundreds of searches.
+
+  Fix: a bounded module-level indexer pool (`max_workers=4`) now
+  submits each result URL to the existing `_get_clean_text()`
+  pipeline (cache → trafilatura → Jina Reader) and feeds
+  `index_page()`. The search response returns immediately; pool
+  workers run in the background. Per-URL failures are isolated
+  (one failed extractor or DB write doesn't abort the batch).
+  Closes #19.
+
 ## [0.13.0] — 2026-05-20
 
 ### Added
