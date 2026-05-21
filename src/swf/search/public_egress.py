@@ -15,11 +15,13 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 
 from .policy import PublicEgressMode, SearchPolicy
 from .query import QueryContext
@@ -166,6 +168,58 @@ DEFAULT_TIMEOUT_SECONDS = 5.0
 # accommodates 50 results from every engine simultaneously; anything
 # bigger is a probable attack or misconfiguration.
 MAX_SEARXNG_BYTES = 2 * 1024 * 1024
+
+
+def _index_results_async(urls: list[str], titles: list[str]) -> None:
+    """Fetch + index search-result URLs into the local `pages` corpus.
+
+    Called in a daemon thread from `search()` so the search response
+    isn't blocked on per-URL extraction. Each URL goes through the
+    existing fetch pipeline (`_get_clean_text`: 7-day disk cache →
+    trafilatura local extraction → Jina Reader fallback) and the
+    cleaned text is handed to `index_page()`, which writes the row +
+    `pages_meta` attribution + `page_cids` so peers' bundle pullers
+    can ship it onward. Without this step, public-egress searches
+    populated only the `search_results` FTS cache — atlas (which plots
+    `pages`) stayed empty and nothing reached the cohort.
+
+    Best-effort: every failure mode (network, extractor, index) is
+    swallowed silently per the same contract as the existing
+    `record_search_results` call.
+    """
+    from swf.web.fetch import _get_clean_text
+    from swf.web.index import index_page
+
+    def _one(url: str, search_title: str) -> None:
+        try:
+            text, extracted_title, _extractor = _get_clean_text(url)
+        except Exception:
+            return
+        if not text or len(text.strip()) < 100:
+            return
+        title = (search_title or extracted_title or "").strip()
+        fetched_at = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+        try:
+            index_page(url=url, title=title, content=text, fetched_at=fetched_at)
+        except Exception:
+            return
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for url, title in zip(urls, titles):
+            pool.submit(_one, url, title)
+
+
+def _spawn_indexer(urls: list[str], titles: list[str]) -> None:
+    """Fire-and-forget wrapper around `_index_results_async`. Lives as
+    a module-level function so tests can override it to run inline,
+    without monkeypatching `threading.Thread` (which would also break
+    the inner `ThreadPoolExecutor`).
+    """
+    threading.Thread(
+        target=_index_results_async,
+        args=(urls, titles),
+        daemon=True,
+    ).start()
 
 
 def search(
@@ -373,6 +427,25 @@ def search(
         except Exception:
             # Indexing is a side-effect for the wall; never block
             # the search response on it.
+            pass
+
+        # Second half of the same field bug: `record_search_results`
+        # only writes title/url/snippet rows into the FTS5
+        # `search_results` cache. Atlas plots `pages` (and the bundle
+        # layer ships `pages` to peers), so without an index_page()
+        # call here, public-egress searches never produce towns and
+        # never reach the cohort. Fire-and-forget so the search
+        # response returns immediately; the daemon thread fetches
+        # each result through the existing extraction pipeline and
+        # feeds index_page() — which handles canonicalization,
+        # junk-title filtering, content-CID, and share-scope
+        # attribution.
+        try:
+            _spawn_indexer(
+                [r.canonical_url for r in out],
+                [r.title for r in out],
+            )
+        except Exception:
             pass
 
     return RouteOutcome(

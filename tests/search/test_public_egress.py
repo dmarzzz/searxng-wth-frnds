@@ -31,6 +31,15 @@ def _ctx(query: str = "decentralized search"):
     return build_context(query, policy_name="default", hmac_secret=b"x" * 32)
 
 
+@pytest.fixture(autouse=True)
+def _no_op_indexer(monkeypatch):
+    """Default `_spawn_indexer` to a no-op so parse-only tests don't
+    fire real network requests in background threads. The three
+    indexing tests below override this with the inline runner.
+    """
+    monkeypatch.setattr(public_egress, "_spawn_indexer", lambda urls, titles: None)
+
+
 class _FakeResp:
     def __init__(self, body: bytes, status: int = 200):
         self._body = body
@@ -168,3 +177,116 @@ def test_empty_results_returns_no_results_status(monkeypatch):
     assert out.results == []
     # network was used even though there were 0 results
     assert out.attempt.network_used is True
+
+
+# ─── search → page-index pipeline ──────────────────────────────────────
+#
+# Regression test for the "atlas stays empty after public-egress search"
+# field bug: before the fix, search() only wrote to the FTS `search_results`
+# cache. The `pages` table never grew, so atlas had no towns to plot and
+# the bundle layer had nothing to share with peers. Now search() also
+# fans out a daemon thread that fetches + indexes each result URL.
+
+def test_results_are_fetched_and_indexed_into_pages(monkeypatch):
+    rows = [
+        {"url": "https://en.wikipedia.org/wiki/Shape_rotator",
+         "title": "Shape rotator", "content": "snippet",
+         "score": 0.9, "engines": ["duckduckgo"]},
+        {"url": "https://example.com/post",
+         "title": "Post title", "content": "snippet",
+         "score": 0.8, "engines": ["brave"]},
+    ]
+    monkeypatch.setattr(public_egress.urllib.request, "urlopen",
+                        lambda req, timeout=None: _FakeResp(_make_searxng_payload(rows)))
+
+    # Stub the extractor so the test doesn't hit the network. Return
+    # content long enough to clear the 100-char floor in _index_results_async.
+    fake_text = "x" * 500
+    monkeypatch.setattr(
+        "swf.web.fetch._get_clean_text",
+        lambda url: (fake_text, "", "test-extractor"),
+    )
+
+    # Capture index_page calls so we don't depend on a writable DB inside
+    # this test. The autouse SWF-state fixture would let it work end-to-end,
+    # but asserting on the call args is cleaner + faster.
+    calls: list[dict] = []
+    def _capture(**kwargs):
+        calls.append(kwargs)
+    monkeypatch.setattr("swf.web.index.index_page", _capture)
+
+    # Run search synchronously, then exec the would-be-async indexer in
+    # the foreground so the test deterministically observes index_page
+    # calls (no timing-flake from waiting on the daemon thread).
+    # Run the would-be-async indexer inline so the test deterministically
+    # observes index_page calls without waiting on a daemon thread.
+    monkeypatch.setattr(
+        public_egress,
+        "_spawn_indexer",
+        public_egress._index_results_async,
+    )
+
+    out = search(_ctx())
+    assert out.attempt.status == "ok"
+    assert len(out.results) == 2
+
+    indexed_urls = sorted(c["url"] for c in calls)
+    assert indexed_urls == [
+        "https://en.wikipedia.org/wiki/Shape_rotator",
+        "https://example.com/post",
+    ]
+    # Title comes from the search-result row, not the extractor (which
+    # returned "" — engines usually have cleaner titles than trafilatura).
+    by_url = {c["url"]: c for c in calls}
+    assert by_url["https://en.wikipedia.org/wiki/Shape_rotator"]["title"] == "Shape rotator"
+    assert by_url["https://example.com/post"]["title"] == "Post title"
+    # Content survived the extractor and the 100-char floor.
+    assert all(len(c["content"]) >= 100 for c in calls)
+
+
+def test_thin_results_are_not_indexed(monkeypatch):
+    # An extractor that returns under 100 chars is treated as junk and
+    # skipped — keeps SPA shells / 404 pages / cookie walls out of the
+    # corpus.
+    rows = [{"url": "https://thin.example/", "title": "Thin",
+             "content": "snippet", "score": 0.5, "engines": ["duckduckgo"]}]
+    monkeypatch.setattr(public_egress.urllib.request, "urlopen",
+                        lambda req, timeout=None: _FakeResp(_make_searxng_payload(rows)))
+    monkeypatch.setattr(
+        "swf.web.fetch._get_clean_text",
+        lambda url: ("too short", "", "test-extractor"),
+    )
+    calls: list[dict] = []
+    monkeypatch.setattr("swf.web.index.index_page",
+                        lambda **kw: calls.append(kw))
+    # Run the would-be-async indexer inline so the test deterministically
+    # observes index_page calls without waiting on a daemon thread.
+    monkeypatch.setattr(
+        public_egress,
+        "_spawn_indexer",
+        public_egress._index_results_async,
+    )
+    search(_ctx())
+    assert calls == []
+
+
+def test_indexing_failures_dont_break_search(monkeypatch):
+    # If the extractor blows up, the search response still succeeds —
+    # indexing is strictly a best-effort side-effect.
+    rows = [{"url": "https://boom.example/", "title": "Boom",
+             "content": "snippet", "score": 0.5, "engines": ["duckduckgo"]}]
+    monkeypatch.setattr(public_egress.urllib.request, "urlopen",
+                        lambda req, timeout=None: _FakeResp(_make_searxng_payload(rows)))
+    def _raise(_url):
+        raise RuntimeError("extractor on fire")
+    monkeypatch.setattr("swf.web.fetch._get_clean_text", _raise)
+    # Run the would-be-async indexer inline so the test deterministically
+    # observes index_page calls without waiting on a daemon thread.
+    monkeypatch.setattr(
+        public_egress,
+        "_spawn_indexer",
+        public_egress._index_results_async,
+    )
+    out = search(_ctx())
+    assert out.attempt.status == "ok"
+    assert len(out.results) == 1
