@@ -2967,6 +2967,26 @@ def main() -> int:
     from swf._logging import bootstrap as _log_bootstrap
     _log_bootstrap()
 
+    # PyInstaller frozen builds ship `certifi` but Python's stdlib ssl
+    # module doesn't auto-discover it on macOS — every HTTPS fetch from
+    # the indexer pool (and any other urllib call) fails with
+    # CERTIFICATE_VERIFY_FAILED. Pointing SSL_CERT_FILE and
+    # REQUESTS_CA_BUNDLE at certifi's bundled cacert.pem fixes urllib,
+    # httpx, requests, and trafilatura's transitive fetchers in one
+    # shot. setdefault so operators who pin a different CA bundle via
+    # env are not overridden.
+    try:
+        import certifi as _certifi
+        _ca = _certifi.where()
+        os.environ.setdefault("SSL_CERT_FILE", _ca)
+        os.environ.setdefault("REQUESTS_CA_BUNDLE", _ca)
+    except Exception:
+        # If certifi is unavailable (extremely unlikely — it's a
+        # transitive dep of trafilatura/httpx), the daemon still starts;
+        # HTTPS just falls back to the system trust store, which is the
+        # pre-fix behavior.
+        pass
+
     argv = sys.argv[1:]
     if argv and argv[0] in _SUBCOMMANDS:
         cmd, rest = argv[0], argv[1:]
