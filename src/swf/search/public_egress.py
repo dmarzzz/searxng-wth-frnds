@@ -211,15 +211,18 @@ def _index_one(url: str, search_title: str) -> None:
     from swf.web.index import index_page
     try:
         text, extracted_title, _extractor = _get_clean_text(url)
-    except Exception:
+    except Exception as e:
+        logger.warning("indexer fetch failed for %s: %s: %s", url, type(e).__name__, e)
         return
     if not text or len(text.strip()) < 100:
+        logger.info("indexer skip %s: text too short (%d chars)", url, len(text.strip()) if text else 0)
         return
     title = (search_title or extracted_title or "").strip()
     fetched_at = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
     try:
         index_page(url=url, title=title, content=text, fetched_at=fetched_at)
-    except Exception:
+    except Exception as e:
+        logger.warning("indexer index_page failed for %s: %s: %s", url, type(e).__name__, e)
         return
 
 

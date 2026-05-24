@@ -522,9 +522,29 @@ def browse_mdns(timeout: float = 1.5) -> list[DiscoveredPeer]:
     hits: dict[str, DiscoveredPeer] = {}
     own_pk = _own_pubkey_for_mdns_filter()
 
+    # Surface NotRunningException specifically so we can skip-and-retry
+    # instead of letting the browser callback raise into the zeroconf
+    # event loop (which would leave the browser permanently blind).
+    try:
+        from zeroconf import NotRunningException  # type: ignore
+    except Exception:  # pragma: no cover — older zeroconf
+        try:
+            from zeroconf._exceptions import NotRunningException  # type: ignore
+        except Exception:
+            class NotRunningException(Exception): pass  # type: ignore
+
     class _Listener(ServiceListener):
         def add_service(self, zc, type_, name):  # noqa: D401,N802
-            info = zc.get_service_info(type_, name, timeout=1000)
+            # Startup race: a service-found event can fire before
+            # zeroconf's async core finishes initializing. Skip this
+            # tick — the service will be re-announced and we'll catch
+            # it next time. Without this, the exception bubbles into
+            # zeroconf's dispatcher and leaves the browser dead.
+            try:
+                info = zc.get_service_info(type_, name, timeout=1000)
+            except NotRunningException:
+                _log(f"mdns: zeroconf not ready yet, deferring {name}")
+                return
             if info is None or not info.addresses:
                 return
             addr = socket.inet_ntoa(info.addresses[0])
