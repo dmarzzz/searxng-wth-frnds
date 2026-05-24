@@ -15,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import re
 import time
 import urllib.error
 import urllib.parse
@@ -140,9 +141,45 @@ def _fetch_jina(url: str, timeout: int = 30) -> str:
         return resp.read().decode("utf-8", errors="replace")
 
 
+_ARXIV_PDF_RE = re.compile(
+    # Captures both modern numeric ids (2104.05849) and old-style ids with
+    # subject prefix (cs.DC/0508053). Trailing version suffix (v1, v2, ...)
+    # and `.pdf` extension are stripped from the captured id.
+    r"^https?://(?:www\.|export\.)?arxiv\.org/pdf/([\w./]+?)(?:v\d+)?(?:\.pdf)?/?$",
+    re.IGNORECASE,
+)
+
+
+def _arxiv_abs_url_for_pdf(url: str) -> str | None:
+    """If `url` is an arxiv PDF URL, return the corresponding abstract page
+    URL (which carries proper title metadata in its HTML <head>). Otherwise
+    return None.
+
+    Examples:
+        https://arxiv.org/pdf/2104.05849            → https://arxiv.org/abs/2104.05849
+        https://arxiv.org/pdf/2104.05849.pdf        → https://arxiv.org/abs/2104.05849
+        https://arxiv.org/pdf/2104.05849v3          → https://arxiv.org/abs/2104.05849
+        https://export.arxiv.org/pdf/cs.DC/0508053  → https://arxiv.org/abs/cs.DC/0508053
+
+    The PDF body has the paper text but trafilatura+Jina don't preserve the
+    paper title from it — pages end up with placeholder titles ("Document"
+    or the URL) and cluster by stray body text rather than topic. The abs
+    page is an HTML page; trafilatura extracts the proper title from
+    <title> + <meta name="citation_title">.
+    """
+    if not url:
+        return None
+    m = _ARXIV_PDF_RE.match(url.strip())
+    if not m:
+        return None
+    arxiv_id = m.group(1)
+    return f"https://arxiv.org/abs/{arxiv_id}"
+
+
 def _get_clean_text(url: str) -> tuple[str, str, str]:
     """Returns (text, title, extractor). Raises on total failure."""
-    # 1. cache
+    # 1. cache (keyed on the user-visible URL — we don't rewrite the
+    #    canonical URL even when we fetch from a different source below).
     cached = _read_cache(url)
     if cached is not None:
         text, extractor = cached
@@ -150,27 +187,52 @@ def _get_clean_text(url: str) -> tuple[str, str, str]:
         # Title is not cached separately; best-effort infer.
         return text, "", extractor
 
-    # 2. local extraction
+    # arxiv PDF → abs page rewrite for fetching. The user's URL stays the
+    # cache key + index key; we just transparently fetch the abs page so
+    # trafilatura can read the proper paper title from HTML metadata.
+    # PDF bodies still go through the Jina fallback path if the abs page
+    # extraction comes up short.
+    fetch_url_target = url
+    rewrite = _arxiv_abs_url_for_pdf(url)
+    if rewrite is not None:
+        _log(f"arxiv pdf detected → fetching abs page instead: {url} → {rewrite}")
+        fetch_url_target = rewrite
+
+    # 2. local extraction (from the rewritten URL when applicable)
     try:
-        html = _fetch_html(url)
-        text, title = _extract_trafilatura(html, url)
+        html = _fetch_html(fetch_url_target)
+        text, title = _extract_trafilatura(html, fetch_url_target)
         if text and len(text.strip()) > 200:
             _write_cache(url, text, "trafilatura")
             world_write(url, text, extractor="trafilatura", title=title)
             _log(f"local extract {url} ({len(text)} chars)")
             return text, title, "trafilatura"
-        _log(f"local extract empty for {url}, falling through to Jina")
+        _log(f"local extract empty for {fetch_url_target}, falling through to Jina")
     except Exception as exc:
-        _log(f"local fetch/extract failed for {url}: {exc}")
+        _log(f"local fetch/extract failed for {fetch_url_target}: {exc}")
 
-    # 3. Jina fallback
+    # 3. Jina fallback — fetch the ORIGINAL url here (not the rewrite).
+    #    For arxiv PDFs, Jina's reader handles the PDF body directly and
+    #    we want that text, not the abs-page snippet. Combined with the
+    #    trafilatura-derived title above (when that succeeded), this gives
+    #    us paper-title metadata + full PDF body in the same page.
     raw = _fetch_jina(url)
     import re as _re
     text = _re.sub(r"\n{3,}", "\n\n", raw).strip()
     _write_cache(url, text, "jina")
     world_write(url, text, extractor="jina")
     _log(f"jina extract {url} ({len(text)} chars)")
-    return text, "", "jina"
+    # If we attempted an arxiv abs-page extract above and got a title out,
+    # propagate it here even though jina was the body extractor. That
+    # title comes from arxiv.org's authoritative metadata.
+    arxiv_title = ""
+    if rewrite is not None:
+        try:
+            html_abs = _fetch_html(rewrite)
+            _t, arxiv_title = _extract_trafilatura(html_abs, rewrite)
+        except Exception:
+            pass
+    return text, arxiv_title, "jina"
 
 
 def fetch_url(url: str, start_char: int = 0, max_chars: int = 16000) -> str:
