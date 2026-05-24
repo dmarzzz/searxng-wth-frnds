@@ -201,6 +201,44 @@ def index_page(*, url: str, title: str, content: str, fetched_at: str) -> None:
                 conn.close()
     except Exception as exc:
         logger.warning("skipped %s: %s", url, exc)
+        return
+
+    # Fire a `contribution_merged` event on the indrex bus so the SROS
+    # renderer's `handleContributionMerged` path runs — that's the same
+    # cinematic materialize() + Atlas.pulseNode + Atlas.notifyDataChanged
+    # pipeline peer-pulled pages get. Without this, self-fetched pages
+    # only show up on the renderer's atlas after the 30s /graph reconcile
+    # interval, which made the user's "search → dot grows live" UX feel
+    # dead. peer_scraper emits `page_added` after its own ingest path
+    # (peer_scraper.py:1203); the comment there ("self-fetched pages
+    # don't go through this path") flagged this gap explicitly.
+    try:
+        from swf.identity import get_or_create_identity
+        from swf import event_bus
+        own_pk = get_or_create_identity().pub_b64
+        # `host` is the renderer's primary territory hint when no
+        # `topic` is set yet. Topic is filled in by the post-ingest
+        # topic-classifier; we leave it empty here and the renderer's
+        # `materialize()` path tolerates that.
+        from urllib.parse import urlparse
+        try:
+            host = urlparse(canon).hostname or ""
+        except Exception:
+            host = ""
+        event_bus.emit("contribution_merged", {
+            "contributor": own_pk,
+            "pages": [{
+                "url": canon,
+                "title": title or "",
+                "host": host,
+                "topic": "",
+            }],
+        })
+    except Exception as emit_exc:
+        # Event-emit must never crash the caller. Indexer pool workers
+        # ignore exceptions anyway, but be explicit so a refactor of
+        # _index_one's error handling doesn't silently regress this.
+        logger.debug("contribution_merged emit skipped: %s", emit_exc)
 
 
 # ── Ship 0.1: query + result-list cache ────────────────────────────────────
