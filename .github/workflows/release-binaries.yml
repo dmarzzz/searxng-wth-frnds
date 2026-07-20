@@ -108,7 +108,7 @@ jobs:
           echo "asset=swf-node-${v}-${{ matrix.label }}" >> "$GITHUB_OUTPUT"
 
       - name: Set up Python 3.12
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           # 3.12 is the latest version pyproject.toml claims to support
           # (requires-python = ">=3.10", classifiers up through 3.12).
